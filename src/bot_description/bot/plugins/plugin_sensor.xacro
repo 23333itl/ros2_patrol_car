@@ -2,7 +2,8 @@
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
     <xacro:macro name="gazebo_sensor_plugin">
 
-        <!-- 激光雷达：默认 ray（CPU），有可用 GPU 驱动时可切到 gpu_lidar。
+        <!-- 激光雷达：默认 gpu_lidar。Gazebo Sim 8 不支持 CPU ray/lidar，
+             切回 ray 会导致 /scan 缺失并使 AMCL 无法发布 map -> odom。
              10 Hz / 360 线足够 slam_toolbox 在迷宫里稳定匹配。 -->
         <gazebo reference="laser_link">
             <sensor name="lidar" type="$(arg lidar_type)">

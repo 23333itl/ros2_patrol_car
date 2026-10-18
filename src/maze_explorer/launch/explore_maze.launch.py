@@ -247,9 +247,9 @@ def generate_launch_description():
             'rviz', default_value='true',
             description='是否启动 RViz'),
         DeclareLaunchArgument(
-            'lidar_type', default_value='ray',
-            description='雷达类型：ray=CPU 雷达（无 GPU 也能跑，默认），'
-                        'gpu_lidar=GPU 雷达（需正常显卡驱动）'),
+            'lidar_type', default_value='gpu_lidar',
+            description='雷达类型：gpu_lidar=Gazebo Sim 8 可用雷达（默认）；'
+                        'ray 不受支持，仅保留参数以兼容旧命令'),
         DeclareLaunchArgument(
             'camera', default_value='false',
             description='是否启用深度相机（当前导航链路不用；需要 GPU/EGL 正常）'),
@@ -257,7 +257,8 @@ def generate_launch_description():
             'gz_gui', default_value='false',
             description='是否显示 Gazebo 图形界面（慢机器上可设 false 只跑物理仿真）'),
         # 独显驱动异常时不要依赖 LIBGL_ALWAYS_SOFTWARE：Ogre2 会按 EGL 设备
-        # 直接选硬件，软件渲染开关可能被拒绝。可靠兜底是 lidar_type:=ray camera:=false。
+        # 直接选硬件，软件渲染开关可能被拒绝。默认 gpu_lidar + camera:=false，
+        # 只有 Ogre2 无法初始化时才尝试 software_gl:=true。
         DeclareLaunchArgument(
             'software_gl', default_value='false',
             description='强制 Mesa 软件渲染（仅在没有可用 GPU 且必须用渲染传感器时尝试）'),

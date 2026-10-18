@@ -1,11 +1,11 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro ="http://www.ros.org/wiki/xacro" name="robot">
 
-    <!-- 传感器配置：默认使用 CPU ray 雷达并关闭深度相机。
-         这样即使独显驱动/EGL 不可用，Gazebo 也不会因为 Ogre2 初始化而崩溃。
-         需要 GPU 雷达/相机时由 launch 传入：
-           lidar_type:=gpu_lidar enable_camera:=true -->
-    <xacro:arg name="lidar_type" default="ray"/>
+    <!-- 传感器配置：默认使用 Gazebo Sim 8 支持的 GPU 雷达并关闭深度相机。
+         Gazebo Sim 8 不支持 CPU ray/lidar；使用 ray 时不会发布 /scan，
+         AMCL 缺少激光输入便无法发布 map -> odom，RViz 机器人模型会全部报无 TF。
+         lidar_type 由 launch 传入；需要相机时再传 enable_camera:=true。 -->
+    <xacro:arg name="lidar_type" default="gpu_lidar"/>
     <xacro:arg name="enable_camera" default="false"/>
 
     <xacro:include filename ="$(find bot_description)/bot/base.urdf.xacro"/>

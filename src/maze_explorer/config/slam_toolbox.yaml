@@ -8,7 +8,7 @@ slam_toolbox:
     map_frame: map
     scan_topic: /scan
     mode: mapping
-    # 雷达量程与 bot 的 ray/gpu_lidar 配置一致
+    # 雷达量程与 bot 的 gpu_lidar 配置一致
     max_laser_range: 8.0
     resolution: 0.05
     # 地图更新间隔（秒）。本机 CPU 充足，1s 更新更及时
