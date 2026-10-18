@@ -1,0 +1,46 @@
+# robot_localization EKF：融合轮式里程计 + IMU，输出 /odometry/filtered
+# 以及 odom -> base_footprint 的 TF（gz 的 DiffDrive 插件已不再发 TF）。
+#
+# 打滑场景下的取舍：
+# - 轮式里程计只取 x 方向线速度——打滑时 y 速度和航向角速度都不可信；
+# - 航向以 IMU 为准（绝对航向角 + z 轴角速度），抑制轮子空转带来的航向漂移；
+# - IMU 线加速度不参与融合：二次积分漂移大，且 gz IMU 噪声已足够污染结果。
+ekf_filter_node:
+  ros__parameters:
+    use_sim_time: true        # launch 里全局 SetParameter 也会设，这里显式写出便于单独启动
+    frequency: 50.0           # 与里程计发布频率一致
+    sensor_timeout: 0.2
+    two_d_mode: true          # 平面机器人：锁死 z / roll / pitch
+    publish_tf: true          # 由本节点发布 odom -> base_footprint
+    publish_acceleration: false
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_footprint
+    world_frame: odom
+
+    # 轮式里程计：只融合 x 线速度。
+    # 注意：原配置误开了 x/y 位置和 yaw（索引 0/1/5），打滑时这些量同样不可信；
+    # 这里改回“只取 vx”，航向完全交给 IMU。
+    odom0: /model/my_robot/odometry   # view_maze.launch.py 会按 robot_name 改写
+    odom0_config: [false, false, false,
+               false, false, false,
+               true,  false, false,
+               false, false, false,
+               false, false, false]
+    odom0_differential: false
+    odom0_relative: false
+    odom0_queue_size: 10
+    odom0_nodelay: true
+
+    # IMU：融合绝对航向角（yaw）+ z 轴角速度
+    imu0: /imu
+    imu0_config: [false, false, false,
+                  false, false, true,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+    imu0_differential: false
+    imu0_relative: false
+    imu0_queue_size: 10
+    imu0_nodelay: true
+    imu0_remove_gravitational_acceleration: true

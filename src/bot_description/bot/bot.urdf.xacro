@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro ="http://www.ros.org/wiki/xacro" name="robot">
+
+    <!-- 传感器配置：默认使用 CPU ray 雷达并关闭深度相机。
+         这样即使独显驱动/EGL 不可用，Gazebo 也不会因为 Ogre2 初始化而崩溃。
+         需要 GPU 雷达/相机时由 launch 传入：
+           lidar_type:=gpu_lidar enable_camera:=true -->
+    <xacro:arg name="lidar_type" default="ray"/>
+    <xacro:arg name="enable_camera" default="false"/>
+
+    <xacro:include filename ="$(find bot_description)/bot/base.urdf.xacro"/>
+    <xacro:include filename ="$(find bot_description)/bot/sensor/camera.urdf.xacro"/>
+    <xacro:include filename ="$(find bot_description)/bot/sensor/imu.urdf.xacro"/>
+    <xacro:include filename ="$(find bot_description)/bot/sensor/laser.urdf.xacro"/>
+    <xacro:include filename ="$(find bot_description)/bot/actuator/wheel.urdf.xacro"/>
+    <xacro:include filename ="$(find bot_description)/bot/actuator/caster.urdf.xacro"/>
+    <!-- 导入gazebo差分驱动插件宏 -->
+    <xacro:include filename ="$(find bot_description)/bot/plugins/plugin_drive.xacro"/>
+    <xacro:include filename ="$(find bot_description)/bot/plugins/plugin_sensor.xacro"/>
+    <!-- 实例化插件，写到URDF，Gazebo Sim加载模型会读取<gazebo>标签 -->
+    <xacro:gazebo_control_plugin/>
+    <xacro:gazebo_sensor_plugin/>
+
+
+
+    <xacro:base_xacro length ="0.12" radius="0.1"/>
+    <xacro:imu_xacro xyz="0 0 0.02"/>
+    <xacro:camera_xacro xyz="0.09 0 0.075"/>
+    <xacro:laser_xacro xyz="0 0 0.1"/>
+    <xacro:wheel_xacro wheel_name="left" xyz="0 0.10 -0.06" />
+    <xacro:wheel_xacro wheel_name="right" xyz="0 -0.10 -0.06" />
+    <xacro:caster_xacro caster_name="front" xyz="0.08 0.0 -0.076" />
+    <xacro:caster_xacro caster_name="back" xyz="-0.08 0.0 -0.076" />
+
+</robot>

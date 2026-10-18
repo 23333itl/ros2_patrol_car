@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro ="http://www.ros.org/wiki/xacro">
+    <xacro:include filename="$(find bot_description)/bot/common_inertial.xacro"/>
+    <xacro:macro name="base_xacro" params="length radius">    
+        <!-- 虚拟地面基准link，无视觉无碰撞无惯性 -->
+        <link name="base_footprint"/>
+        <joint name="base_footprint_joint" type="fixed">
+            <parent link="base_footprint"/>
+            <child link="base_link"/>
+            <!-- 底盘中心高度 = 半厚 length/2 + 轮半径 0.032 = 0.092 m -->
+            <origin xyz="0 0 ${length/2.0+0.032}" rpy="0 0 0"/>
+        </joint>
+
+        <link name="base_link">
+            <visual>    
+                <origin xyz="0 0 0" rpy="0 0 0"/>
+                <geometry>
+                    <cylinder radius="${radius}" length="${length}" />
+                </geometry>
+                <material name="blue">
+                    <color rgba="0.1 0.1 0.9 0.5"/>
+                </material>
+            </visual>
+            <collision>
+                <origin xyz="0 0 0" rpy="0 0 0"/>
+                <geometry>
+                    <cylinder radius="${radius}" length="${length}" />
+                </geometry>
+                <material name="white">
+                    <color rgba="1 1 1 0.5"/>
+                </material>
+            </collision>
+            <xacro:cylinder_inertia  m="1.0" r="${radius}" h="${length}"/>
+        </link>
+    </xacro:macro>
+</robot>
