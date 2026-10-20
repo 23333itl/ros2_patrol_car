@@ -19,7 +19,6 @@ install(
 
 install(
   PROGRAMS
-    scripts/odom_to_tf.py
     scripts/joint_state_relay.py
   DESTINATION lib/${PROJECT_NAME}
 )

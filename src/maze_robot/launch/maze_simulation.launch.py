@@ -23,6 +23,7 @@ from launch.actions import (
     OpaqueFunction,
     SetEnvironmentVariable,
     TimerAction,
+    ExecuteProcess,
 )
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -187,6 +188,8 @@ def _nav2_nodes(context):
     ]
 
 
+
+
 def generate_launch_description():
     world = LaunchConfiguration('world')
     robot_name = LaunchConfiguration('robot_name')
@@ -214,6 +217,15 @@ def generate_launch_description():
         parameters=[{'robot_description': robot_description, 'use_sim_time': True}],
         output='screen',
     )
+    force_lidar_relink = TimerAction(
+    period=5.0,  # 延迟5秒，确保模型和传感器已完全加载
+    actions=[
+        ExecuteProcess(
+            cmd=["gz", "model", "-m", "my_robot", "-l", "laser_link"],
+            output="screen"
+        )
+    ]
+    )
 
     return LaunchDescription([
         # DeclareLaunchArgument(
@@ -221,6 +233,7 @@ def generate_launch_description():
         #     default_value=PathJoinSubstitution(
         #         [FindPackageShare('maze_robot'), 'generated', 'maze.world']),
         #     description='要打开的 .world 文件路径'),
+        force_lidar_relink,
         DeclareLaunchArgument(
             'robot_name', default_value='my_robot',
             description='小车在仿真中的实体名（决定 /model/<名>/cmd_vel 等话题名）'),
@@ -249,7 +262,7 @@ def generate_launch_description():
             'camera', default_value='false',
             description='是否启用深度相机（当前导航链路不用；需要 GPU/EGL 正常）'),
         DeclareLaunchArgument(
-            'gz_gui', default_value='false',
+            'gz_gui', default_value='true',
             description='是否显示 Gazebo 图形界面（慢机器上可设 false 只跑物理仿真）'),
         # 注意：LIBGL_ALWAYS_SOFTWARE 只影响 Mesa GL，不能让 Ogre2 的 EGL
         # 设备枚举改用软件设备；默认 lidar_type:=gpu_lidar、camera:=false，
@@ -288,7 +301,7 @@ def generate_launch_description():
 
         # ==================== 3. 延时 spawn 小车 ====================
         # 必须等 Gazebo Server 把世界加载完，留 5 秒余量
-        TimerAction(period=5.0, actions=[OpaqueFunction(function=_spawn_robot)]),
+        TimerAction(period=3.0, actions=[OpaqueFunction(function=_spawn_robot)]),
 
         # ==================== 4. ROS-Gazebo 话题桥接 ====================
         # 话题名与 bot_description 的插件配置一一对应；
@@ -335,7 +348,7 @@ def generate_launch_description():
         # ==================== 5. 延时启动 Nav2 ====================
         # 等 spawn 和桥接就绪后再拉起导航栈（地图加载本身不依赖仿真）
         TimerAction(
-            period=8.0,
+            period=7.0,
             actions=[OpaqueFunction(function=_nav2_nodes)],
             condition=IfCondition(LaunchConfiguration('nav2')),
         ),

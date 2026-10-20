@@ -8,7 +8,7 @@
 ekf_filter_node:
   ros__parameters:
     use_sim_time: true        # launch 里全局 SetParameter 也会设，这里显式写出便于单独启动
-    frequency: 50.0           # 与里程计发布频率一致
+    frequency: 50.0            # 与 DiffDrive odom_publish_frequency=50 对齐
     sensor_timeout: 0.2
     two_d_mode: true          # 平面机器人：锁死 z / roll / pitch
     publish_tf: true          # 由本节点发布 odom -> base_footprint

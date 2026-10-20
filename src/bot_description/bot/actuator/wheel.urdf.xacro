@@ -33,8 +33,8 @@
     <gazebo reference="${wheel_name}_wheel_link">
             <!-- 橡胶轮/地面摩擦约 1.0 即可；20.0 会让 ODE 接触求解器过刚，
                  容易出现轮子抖动或整车弹跳。kp 也从 1e9 降到 1e6。 -->
-            <mu1 value="1.0" />
-            <mu2 value="1.0" />
+            <mu1 value="20.0" />
+            <mu2 value="20.0" />
             <kp value="1000000.0" />
             <kd value="100.0" />
     </gazebo>
