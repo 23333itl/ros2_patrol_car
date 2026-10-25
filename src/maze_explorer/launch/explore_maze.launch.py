@@ -132,16 +132,22 @@ def _slam_nav2_nodes(context):
     gc['height'] = 16
     # 探索模式降速：转快了相邻两帧旋转角太大，扫描匹配容易糊
     vs = params.setdefault('velocity_smoother', {}).setdefault('ros__parameters', {})
-    vs['max_velocity'] = [0.4, 0.0, 0.8]
+    vs['max_velocity'] = [0.25, 0.0, 0.5]
     vs['min_velocity'] = [-0.4, 0.0, -0.8]
     vs['odom_topic'] = odom_topic
     for node_name in ('bt_navigator', 'controller_server'):
         params.setdefault(node_name, {}).setdefault('ros__parameters', {})[
             'odom_topic'] = odom_topic
-    mppi = params.setdefault('controller_server', {}).setdefault(
+    # RegulatedPurePursuitController 参数
+    rpp = params.setdefault('controller_server', {}).setdefault(
         'ros__parameters', {}).setdefault('FollowPath', {})
-    mppi['vx_max'] = 0.4
-    mppi['wz_max'] = 0.8
+    rpp['max_linear_vel'] = 0.20      # 最大线速度 m/s，迷宫建图推荐0.15‑0.25
+    rpp['max_angular_vel'] = 0.40     # 最大角速度 rad/s，不要大于0.5
+    rpp['desired_linear_vel'] = 0.18  # 期望行驶速度
+    # mppi = params.setdefault('controller_server', {}).setdefault(
+    #     'ros__parameters', {}).setdefault('FollowPath', {})
+    # mppi['vx_max'] = 0.4
+    # mppi['wz_max'] = 0.8
     tmp = tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False)
     yaml.safe_dump(params, tmp)
     tmp.close()
@@ -149,15 +155,23 @@ def _slam_nav2_nodes(context):
 
     return [
         LogInfo(msg=f'探索完成后的地图保存路径：{map_save_path}.pgm/.yaml'),
-        # ---- 在线建图：slam_toolbox（生命周期节点，由 lifecycle_manager_slam 激活）----
-        Node(package='slam_toolbox', executable='async_slam_toolbox_node',
-             name='slam_toolbox', parameters=[slam_params], output='screen'),
-        Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
-             name='lifecycle_manager_slam',
-             parameters=[{'autostart': True,
-                          'node_names': ['slam_toolbox'],
-                          'bond_timeout': 10.0}],
-             output='screen'),
+        # ---- 在线建图：使用 slam_toolbox 官方 launch 自动 configure/activate ----
+        # 不使用 lifecycle_manager 的 bond 心跳：本机 slam_toolbox 在 bond
+        # 检查下会被误判为失联并重启，导致 /map 被重新发布为未知区域。
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                PathJoinSubstitution([
+                    FindPackageShare('slam_toolbox'),
+                    'launch',
+                    'online_async_launch.py',
+                ])),
+            launch_arguments={
+                'slam_params_file': slam_params,
+                'use_sim_time': 'true',
+                'autostart': 'true',
+                'use_lifecycle_manager': 'false',
+            }.items(),
+        ),
         # ---- 导航核心（无 map_server / AMCL）----
         Node(package='nav2_controller', executable='controller_server', name='controller_server',
              parameters=[resolved_params], output='screen'),
@@ -254,7 +268,7 @@ def generate_launch_description():
             'camera', default_value='false',
             description='是否启用深度相机（当前导航链路不用；需要 GPU/EGL 正常）'),
         DeclareLaunchArgument(
-            'gz_gui', default_value='false',
+            'gz_gui', default_value='true',
             description='是否显示 Gazebo 图形界面（慢机器上可设 false 只跑物理仿真）'),
         # 独显驱动异常时不要依赖 LIBGL_ALWAYS_SOFTWARE：Ogre2 会按 EGL 设备
         # 直接选硬件，软件渲染开关可能被拒绝。默认 gpu_lidar + camera:=false，
@@ -289,7 +303,7 @@ def generate_launch_description():
             condition=UnlessCondition(LaunchConfiguration('gz_gui'))),
 
         # ==================== 3. 延时 spawn 小车 ====================
-        TimerAction(period=5.0, actions=[OpaqueFunction(function=_spawn_robot)]),
+        TimerAction(period=2.0, actions=[OpaqueFunction(function=_spawn_robot)]),
 
         # ==================== 4. ROS-Gazebo 话题桥接 ====================
         # 话题名与 bot_description 的插件配置一一对应；
@@ -333,7 +347,7 @@ def generate_launch_description():
         # ==================== 5. 延时启动 SLAM + Nav2 + 探索节点 ====================
         # 等 spawn 和桥接就绪后再拉起导航栈
         TimerAction(
-            period=20.0,
+            period=6.0,
             actions=[OpaqueFunction(function=_slam_nav2_nodes)],
         ),
 

@@ -3,6 +3,7 @@
 slam_toolbox:
   ros__parameters:
     use_sim_time: true
+    publish_graph: true
     odom_frame: odom
     base_frame: base_footprint
     map_frame: map
@@ -11,16 +12,23 @@ slam_toolbox:
     # 雷达量程与 bot 的 gpu_lidar 配置一致
     max_laser_range: 8.0
     resolution: 0.05
-    # 地图更新间隔（秒）。本机 CPU 充足，1s 更新更及时
-    map_update_interval: 1.0
+    # 降低完整地图发布频率，避免 RViz 反复重建地图造成卡顿
+    map_update_interval: 2.0
     transform_publish_period: 0.05
     # 10Hz 雷达下 0.5s 足够；太长反而会拿过期 TF 做匹配
+    minimum_time_interval: 0.2
     transform_timeout: 0.5
     tf_buffer_duration: 30.0
-    # 降低建图触发频率，省 CPU：挪动 10cm 或转过 0.1 rad 才处理一帧
-    minimum_travel_distance: 0.1
-    minimum_travel_heading: 0.1
+    # 降低建图触发频率，省 CPU：挪动 10cm 或转过 0.05 rad 才处理一帧
+    minimum_travel_distance: 0.08
+    minimum_travel_heading: 0.05
+    controller_frequency: 20.0  # 默认 10.0，翻倍，车走得更平滑
     throttle_scans: 1
     # 迷宫走廊纹理高度重复，误回环会把地图瞬间修烂（重影墙封死走廊），
     # 且 EKF（轮速+IMU）里程计在小迷宫里精度足够，直接关掉回环
     do_loop_closing: false
+     # 放宽扫描匹配器的搜索空间（防止车转太快，稍微偏一点就找不到了）
+    correlation_search_space_dimension: 0.3
+    correlation_search_space_resolution: 0.01
+    loop_search_maximum_distance: 4.0
+    correlation_search_space_smear_deviation: 0.1

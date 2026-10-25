@@ -20,9 +20,9 @@
                      5 Nm 对 1.8 kg 小车已经远超轮胎附着极限。 -->
                 <max_wheel_torque>5.0</max_wheel_torque>
                 <max_wheel_acceleration>20.0</max_wheel_acceleration>
-                <max_linear_velocity>1.0</max_linear_velocity>
+                <max_linear_velocity>0.25</max_linear_velocity>
                 <min_linear_velocity>-1.0</min_linear_velocity>
-                <max_angular_velocity>1.0</max_angular_velocity>
+                <max_angular_velocity>0.5</max_angular_velocity>
                 <min_angular_velocity>-1.0</min_angular_velocity>
             </plugin>
             <!-- 发布轮子关节状态，robot_state_publisher 需要它才能发轮子 TF -->
