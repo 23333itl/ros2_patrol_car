@@ -1,0 +1,6 @@
+status: stalled
+completed: false
+reason: "恢复等待新鲜完整 360° 激光、有效 TF 和 active 的 Nav2；保持静止"
+resumable: true
+map_saved: true
+simulation_time: 3502.34

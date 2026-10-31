@@ -1,0 +1,70 @@
+# 仅覆盖明确列出的参数；baseline 保留 slam_params 文件的原始值。
+# 启动默认使用用户实测准确的 simulation_stable；baseline 保留用于对照。
+baseline: {}
+baseline_turn:
+  check_min_dist_and_heading_precisely: true
+near_chains:
+  use_scan_matching: true
+  do_loop_closing: false
+  use_scan_barycenter: false
+  link_scan_maximum_distance: 0.30
+  link_match_minimum_response_fine: 0.70
+heading_prior:
+  use_scan_matching: true
+  do_loop_closing: false
+  use_scan_barycenter: false
+  link_scan_maximum_distance: 0.30
+  link_match_minimum_response_fine: 0.70
+  # 本版本内部会对该值平方；调小会加强连续匹配的里程计航向约束。
+  # 邻近链匹配不使用这一惩罚，因此仍需上面的关联限制。
+  angle_variance_penalty: 0.02
+  minimum_angle_penalty: 0.50
+  coarse_search_angle_offset: 0.052359878
+  coarse_angle_resolution: 0.008726646
+  # Karto 精匹配中此参数实际用作角度步长：0.05 度。
+  fine_search_angle_offset: 0.000872665
+  use_response_expansion: false
+odometry_only:
+  # 仅作诊断对照，不用于正式导航默认值。
+  use_scan_matching: false
+  do_loop_closing: false
+heading_prior_turn:
+  # 与 heading_prior 保持完全相同，仅启用转向扫描筛选。
+  use_scan_matching: true
+  do_loop_closing: false
+  use_scan_barycenter: false
+  link_scan_maximum_distance: 0.30
+  link_match_minimum_response_fine: 0.70
+  angle_variance_penalty: 0.02
+  minimum_angle_penalty: 0.50
+  coarse_search_angle_offset: 0.052359878
+  coarse_angle_resolution: 0.008726646
+  fine_search_angle_offset: 0.000872665
+  use_response_expansion: false
+  check_min_dist_and_heading_precisely: true
+
+# 长时仿真的保守改进候选：保留顺序扫描匹配，但禁止没有里程计先验的
+# 邻近扫描链约束。对称走廊中这些约束会放大缓慢的平移误差；Karto 的
+# 匹配响应最大为 1.0，因此 1.1 只关闭该类边，不关闭正常顺序边。
+# 局部/全局回环候选在 1510 s 回放中均未通过几何验收，不在这里启用。
+simulation_stable:
+  use_scan_matching: true
+  do_loop_closing: false
+  use_scan_barycenter: false
+  link_scan_maximum_distance: 0.3
+  link_match_minimum_response_fine: 1.1
+  scan_queue_size: 1
+  angle_variance_penalty: 0.005
+  minimum_angle_penalty: 0.1
+  coarse_search_angle_offset: 0.017453293
+  coarse_angle_resolution: 0.001745329
+  fine_search_angle_offset: 0.000174533
+  use_response_expansion: false
+  check_min_dist_and_heading_precisely: true
+  distance_variance_penalty: 0.05
+  minimum_distance_penalty: 0.1
+  correlation_search_space_dimension: 0.3
+  correlation_search_space_resolution: 0.01
+  correlation_search_space_smear_deviation: 0.1
+  resolution: 0.025
+

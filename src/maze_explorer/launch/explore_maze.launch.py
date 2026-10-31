@@ -81,7 +81,7 @@ def _ekf_node(context):
     """按 robot_name 改写 EKF 的里程计话题，返回 EKF 节点。
 
     融合轮式里程计 + IMU，发布 /odometry/filtered 和 odom -> base_footprint TF，
-    减小打滑造成的 odom 漂移（gz 侧 DiffDrive 插件不发 TF）。
+    减小打滑造成的 odom 漂移（Gazebo 的 DiffDrive TF 不桥接到 ROS）。
     """
     robot_name = LaunchConfiguration('robot_name').perform(context)
     ekf_params = LaunchConfiguration('ekf_params').perform(context)
@@ -110,6 +110,21 @@ def _slam_nav2_nodes(context):
     robot_name = LaunchConfiguration('robot_name').perform(context)
     nav2_params = LaunchConfiguration('nav2_params').perform(context)
     slam_params = LaunchConfiguration('slam_params').perform(context)
+    slam_profile = LaunchConfiguration('slam_profile').perform(context)
+    profile_path = os.path.join(get_package_share_directory('maze_explorer'),
+                                'config', 'slam_profiles.yaml')
+    with open(profile_path, 'r', encoding='utf-8') as f:
+        profiles = yaml.safe_load(f)
+    if slam_profile not in profiles:
+        raise ValueError(f'Unknown slam_profile {slam_profile!r}; choose {list(profiles)}')
+    if profiles[slam_profile]:
+        with open(slam_params, 'r', encoding='utf-8') as f:
+            slam_config = yaml.safe_load(f)
+        slam_config['slam_toolbox']['ros__parameters'].update(profiles[slam_profile])
+        slam_file = tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False)
+        yaml.safe_dump(slam_config, slam_file)
+        slam_file.close()
+        slam_params = slam_file.name
     map_save_path = LaunchConfiguration('map_save_path').perform(context)
     use_ekf = LaunchConfiguration('ekf').perform(context).lower() in ('1', 'true', 'yes')
     odom_topic = '/odometry/filtered' if use_ekf else f'/model/{robot_name}/odometry'
@@ -123,41 +138,36 @@ def _slam_nav2_nodes(context):
         'static_layer', {})
     static_layer['map_topic'] = '/map'
     static_layer['map_subscribe_transient_local'] = True
-    # SLAM 模式下地图不断长大，而静态 global_costmap 的尺寸在启动时固定，
-    # 前沿目标很容易落到 costmap 边界外，报 "Goal was outside bounds" 而失败；
-    # 改成以机器人为中心的滚动窗口，边界永远跟着机器人走。
+    # StaticLayer 随 /map 的尺寸变化调整全局地图，保留整张已知地图供回退规划。
     gc = params['global_costmap']['global_costmap']['ros__parameters']
-    gc['rolling_window'] = True
-    gc['width'] = 16   # 覆盖激光 8m 量程，前沿目标一定在窗口内
-    gc['height'] = 16
-    # 探索模式降速：转快了相邻两帧旋转角太大，扫描匹配容易糊
+    gc['rolling_window'] = False
+    gc['track_unknown_space'] = True
+    planner = params.setdefault('planner_server', {}).setdefault(
+        'ros__parameters', {}).setdefault('GridBased', {})
+    planner['allow_unknown'] = False
+    planner['tolerance'] = 0.05  # 短前沿目标不能提前半米接受替代终点。
     vs = params.setdefault('velocity_smoother', {}).setdefault('ros__parameters', {})
-    vs['max_velocity'] = [0.25, 0.0, 0.5]
-    vs['min_velocity'] = [-0.4, 0.0, -0.8]
     vs['odom_topic'] = odom_topic
     for node_name in ('bt_navigator', 'controller_server'):
         params.setdefault(node_name, {}).setdefault('ros__parameters', {})[
             'odom_topic'] = odom_topic
-    # RegulatedPurePursuitController 参数
-    rpp = params.setdefault('controller_server', {}).setdefault(
-        'ros__parameters', {}).setdefault('FollowPath', {})
-    rpp['max_linear_vel'] = 0.20      # 最大线速度 m/s，迷宫建图推荐0.15‑0.25
-    rpp['max_angular_vel'] = 0.40     # 最大角速度 rad/s，不要大于0.5
-    rpp['desired_linear_vel'] = 0.18  # 期望行驶速度
-    # mppi = params.setdefault('controller_server', {}).setdefault(
-    #     'ros__parameters', {}).setdefault('FollowPath', {})
-    # mppi['vx_max'] = 0.4
-    # mppi['wz_max'] = 0.8
+    # 前沿目标只要求抵达观察位置，避免为满足任意目标 yaw 原地反复转向。
+    controller = params['controller_server']['ros__parameters']
+    controller['goal_checker_plugins'] = ['exploration_goal_checker']
+    controller['exploration_goal_checker'] = {
+        'plugin': 'nav2_controller::PositionGoalChecker',
+        'xy_goal_tolerance': 0.05,
+        'stateful': True,
+    }
     tmp = tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False)
     yaml.safe_dump(params, tmp)
     tmp.close()
     resolved_params = tmp.name
 
     return [
+        LogInfo(msg=f'SLAM profile: {slam_profile}; parameters: {slam_params}'),
         LogInfo(msg=f'探索完成后的地图保存路径：{map_save_path}.pgm/.yaml'),
-        # ---- 在线建图：使用 slam_toolbox 官方 launch 自动 configure/activate ----
-        # 不使用 lifecycle_manager 的 bond 心跳：本机 slam_toolbox 在 bond
-        # 检查下会被误判为失联并重启，导致 /map 被重新发布为未知区域。
+        # ---- 在线建图：生命周期服务可靠启动，避免启动事件丢失后停在 inactive ----
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 PathJoinSubstitution([
@@ -168,10 +178,16 @@ def _slam_nav2_nodes(context):
             launch_arguments={
                 'slam_params_file': slam_params,
                 'use_sim_time': 'true',
-                'autostart': 'true',
+                'autostart': 'false',
                 'use_lifecycle_manager': 'false',
             }.items(),
         ),
+        # 只使用 configure/activate 服务，不创建 bond；避免误判心跳后重启地图。
+        Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
+             name='lifecycle_manager_slam',
+             parameters=[{'autostart': True, 'node_names': ['slam_toolbox'],
+                          'bond_timeout': 0.0, 'use_sim_time': True}],
+             output='screen'),
         # ---- 导航核心（无 map_server / AMCL）----
         Node(package='nav2_controller', executable='controller_server', name='controller_server',
              parameters=[resolved_params], output='screen'),
@@ -195,8 +211,9 @@ def _slam_nav2_nodes(context):
         # ---- 自主探索节点（内部会等 Nav2 action server 就绪再开始）----
         Node(package='maze_explorer', executable='explorer_node', name='maze_explorer',
              parameters=[{'map_save_path': map_save_path,
-                          # 卡死自恢复（原地旋转）需要直接发速度指令
-                          'cmd_vel_topic': f'/model/{robot_name}/cmd_vel'}],
+                          'robot_radius': gc.get('robot_radius', 0.13),
+                          'footprint_padding': gc.get('footprint_padding', 0.0)}],
+             condition=IfCondition(LaunchConfiguration('explore')),
              output='screen'),
     ]
 
@@ -248,8 +265,15 @@ def generate_launch_description():
             default_value=os.path.join(explorer_share, 'config', 'slam_toolbox.yaml'),
             description='slam_toolbox 参数文件路径'),
         DeclareLaunchArgument(
+            'slam_profile', default_value='simulation_stable',
+            description='SLAM 对照配置：baseline / baseline_turn / near_chains / heading_prior / heading_prior_turn / '
+                        'simulation_stable（默认，用户已实测的无回环配置）/ odometry_only（仅用于诊断）'),
+        DeclareLaunchArgument(
             'map_save_path', default_value='explored_maze',
             description='探索完成后的地图保存路径（不含扩展名）'),
+        DeclareLaunchArgument(
+            'explore', default_value='true',
+            description='是否自动探索；false 用于单独验证建图和导航链路'),
         DeclareLaunchArgument(
             'ekf', default_value='true',
             description='是否启动 robot_localization EKF（融合里程计 + IMU，发布 odom TF）'),

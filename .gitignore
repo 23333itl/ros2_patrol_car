@@ -46,3 +46,6 @@ Thumbs.db
 *.tar
 *.tar.gz
 *.zip
+
+# 原始 ROS/Gazebo 验证数据（报告保存在源码 docs）
+diagnostics/

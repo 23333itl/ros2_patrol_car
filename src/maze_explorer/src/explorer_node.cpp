@@ -1,579 +1,734 @@
-#include <chrono>
-#include <functional>
-#include <memory>
-#include <cstdint>
-#include <cmath>
-#include <vector>
-#include <array>
 #include <algorithm>
-#include <utility>
-#include <queue>
-#include <limits>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <fstream>
+#include <iomanip>
+#include <limits>
+#include <memory>
+#include <string>
+#include <vector>
 
+#include "lifecycle_msgs/msg/state.hpp"
+#include "lifecycle_msgs/srv/get_state.hpp"
+#include "nav2_msgs/action/back_up.hpp"
+#include "nav2_msgs/action/compute_path_to_pose.hpp"
+#include "nav2_msgs/action/navigate_to_pose.hpp"
+#include "nav2_msgs/action/spin.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
+#include "rclcpp/create_timer.hpp"
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
 #include "tf2/exceptions.hpp"
+#include "tf2/utils.h"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.hpp"
-#include "rclcpp/rclcpp.hpp"
-#include "nav2_msgs/action/navigate_to_pose.hpp"
-#include "rclcpp_action/rclcpp_action.hpp"
-#include "geometry_msgs/msg/twist.hpp" //用于控制小车自旋
-#include "nav2_msgs/srv/clear_entire_costmap.hpp"
+#include "maze_explorer/frontier_search.hpp"
+#include "maze_explorer/operation_tracker.hpp"
 
-
-using NavigateToPose = nav2_msgs::action::NavigateToPose;
-using GoalHandleNav = rclcpp_action::ClientGoalHandle<NavigateToPose>;
 using namespace std::chrono_literals;
+using Navigate = nav2_msgs::action::NavigateToPose;
+using ComputePath = nav2_msgs::action::ComputePathToPose;
+using BackUp = nav2_msgs::action::BackUp;
+using Spin = nav2_msgs::action::Spin;
+using Phase = maze_explorer::Phase;
+using Candidate = maze_explorer::Candidate;
+using GetState = lifecycle_msgs::srv::GetState;
+template<class Action> using Handle = rclcpp_action::ClientGoalHandle<Action>;
 
-// 8 连通和 4 连通的方向数组
-constexpr std::array<std::pair<int,int>,8> kDirs8 = {
-  {{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}}
-};
-constexpr std::array<std::pair<int,int>,4> kDirs4 = {
-  {{1,0},{-1,0},{0,1},{0,-1}}
-};
-
-//最小前沿距离限制 太小容易导致小车碎步抖动死锁 太大容易无法行动直接丢弃
-constexpr double kMinFrontierGoalDistance = 0.4;
-constexpr double kRecentGoalRadius = 0.4;
-constexpr double kRecentGoalCooldownSeconds = 10.0;
-constexpr double kFailedGoalRadius = 0.5;
-constexpr double kFailedGoalCooldownSeconds = 30.0;
-constexpr int kMaxConsecutiveFailures = 3;
-constexpr int kFinishAfterUnreachable = 10;
-
-// 把bfs找到的前沿格聚成簇，小于min_frontier_size丢弃
-struct Frontier
+class ExplorerNode : public rclcpp::Node
 {
-  double goal_x=0.0;       // 导航目标点的 x (通常用质心)
-  double goal_y=0.0;       // 导航目标点的 y
-  double centroid_x=0.0;   // 簇的几何中心点 x
-  double centroid_y=0.0;   // 簇的几何中心点 y
-  double path_dist=0.0;    // 从机器人当前位置到该簇的实际可通行距离 (BFS距离)
-};
-
-struct FailedGoal
-{
-  double x=0.0;
-  double y=0.0;
-  rclcpp::Time time;
-};
-
-// 订阅slam的话题
-// 主循环是一个定时器驱动的状态机： 1.等待nav2上线 2.空闲 3.正在导航 4.探索完成
-// 看门狗来判断长时间没有任何可以探索的地方 -> 存图
-
-// 可走区域和未知区域的交界 -> 前沿
-
-class ExplorerNode : public rclcpp::Node {
 public:
-  ExplorerNode() : Node("maze_explorer") {
-    clear_costmap_client_ = this->create_client<nav2_msgs::srv::ClearEntireCostmap>(
-    "/global_costmap/clear_entirely_global_costmap");
-    clear_local_costmap_client_ = this->create_client<nav2_msgs::srv::ClearEntireCostmap>(
-    "/local_costmap/clear_entirely_local_costmap");
-    finish_after_empty_=5;
-    timer_ = create_wall_timer(2s,std::bind(&ExplorerNode::onTimer,this));
-    // 订阅 /map 话题，使用 transient_local 确保能收到最新发布的静态地图
-    map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>
-    ("/map",rclcpp::QoS(1).transient_local().reliable(),
-      [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg){map_=msg;});
-    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+  ExplorerNode() : Node("maze_explorer")
+  {
+    save_path_ = declare_parameter<std::string>("map_save_path", "explored_maze");
+    const double radius = declare_parameter("robot_radius", 0.13);
+    const double padding = declare_parameter("footprint_padding", 0.0);
+    // Nav2 pads each polygon vertex in both x and y, including diagonal vertices.
+    // Its padded circle polygon can extend farther than radius + padding.
+    padded_radius_ = radius + std::sqrt(2.0) * padding;
+    goal_clearance_margin_ = declare_parameter("goal_clearance_margin", 0.025);
+    map_timeout_ = declare_parameter("map_timeout", 5.0);
+    tf_timeout_ = declare_parameter("tf_timeout", 2.0);
+    action_timeout_ = declare_parameter("action_response_timeout", 10.0);
+    planning_timeout_ = declare_parameter("planning_timeout", 10.0);
+    recovery_scan_timeout_ = declare_parameter("recovery_scan_timeout", 0.5);
+    const auto no_progress = declare_parameter("no_progress_timeout", 30.0);
+    const auto movement = declare_parameter("required_movement", 0.10);
+    if (radius <= 0 || padding < 0 || goal_clearance_margin_ < 0 ||
+      padded_radius_ <= 0 || map_timeout_ <= 0 || tf_timeout_ <= 0 ||
+      action_timeout_ <= 0 || planning_timeout_ <= 0 || recovery_scan_timeout_ <= 0 ||
+      no_progress <= 0 || movement <= 0)
+    {
+      throw std::invalid_argument("exploration radii and timeouts must be positive");
+    }
+    watchdog_ = maze_explorer::ProgressWatchdog(no_progress, movement);
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-    nav_client_ = rclcpp_action::create_client<NavigateToPose>(this,"navigate_to_pose");
-    //自旋用的速度发布者和定时器
-    cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("/model/my_robot/cmd_vel", 10);
-    spin_timer_ = create_wall_timer(100ms, std::bind(&ExplorerNode::spinCallback, this));
-    spin_timer_->cancel(); // 默认取消
-    RCLCPP_INFO(get_logger(),"探索节点已启动");
+    map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      "/map", rclcpp::QoS(1).transient_local().reliable(),
+      [this](nav_msgs::msg::OccupancyGrid::SharedPtr map) {
+        if (!maze_explorer::validMap(*map)) {
+          empty_maps_ = 0;
+          RCLCPP_WARN(get_logger(), "忽略无效地图");
+          return;
+        }
+        map_ = map;
+        map_received_ = now().seconds();
+        ++map_revision_;
+        // An intervening uncertain/frontier map breaks the completion streak even
+        // if the slower decision timer never samples that particular revision.
+        if (empty_maps_ > 0) {
+          Pose robot;
+          if (!mapFresh() || !pose("map", robot)) {empty_maps_ = 0; return;}
+          const auto check = maze_explorer::findCandidates(*map_, robot.x, robot.y,
+            padded_radius_, [](double, double) {return true;});
+          if (!check.robot_in_known_free || check.frontier_cells != 0) {empty_maps_ = 0;}
+        }
+      });
+    scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
+      "/scan", rclcpp::SensorDataQoS(),
+      [this](sensor_msgs::msg::LaserScan::SharedPtr scan) {
+        scan_ = scan;
+        scan_received_ = now().seconds();
+      });
+    nav_client_ = rclcpp_action::create_client<Navigate>(this, "navigate_to_pose");
+    plan_client_ = rclcpp_action::create_client<ComputePath>(this, "compute_path_to_pose");
+    backup_client_ = rclcpp_action::create_client<BackUp>(this, "backup");
+    spin_client_ = rclcpp_action::create_client<Spin>(this, "spin");
+    for (const auto * name : {"bt_navigator", "planner_server", "controller_server",
+      "behavior_server", "velocity_smoother"})
+    {
+      lifecycle_.push_back({create_client<GetState>(std::string("/") + name + "/get_state")});
+    }
+    // ROS-clock timers pause with Gazebo; wall-clock tick counting changes recovery distance.
+    timer_ = rclcpp::create_timer(this, get_clock(), rclcpp::Duration(500ms),
+      [this]() {onTimer();});
+    RCLCPP_INFO(get_logger(), "探索节点已启动：完整半径 %.3fm，地图保存 %s；恢复使用 Nav2 action",
+      padded_radius_, save_path_.c_str());
   }
 
 private:
-  // 统计整张地图一共有多少个前沿格子（仅用于打印日志）
-  int countFrontiers(const nav_msgs::msg::OccupancyGrid& m) const
+  enum class Kind { Plan, Navigation, Backup, Spin };
+  struct Pose {double x{}, y{}, yaw{};};
+  struct LifecycleCheck
   {
-    const int w = m.info.width,h = m.info.height;
-    int c=0;
-    for(int x=0;x<w;x++)
-    {
-      for(int y=0;y<h;y++)
-      {
-        if(!isFree(m,x,y))
-          continue;
-        for(const auto &[dx,dy]:kDirs8)
-        {
-          const int nx=x+dx,ny=y+dy;
-          if(nx<0||nx>=w||ny<0||ny>=h) continue;
-          if(m.data[ny*w+nx]<0)
-          {
-            c++;
-            break;
-          }
-        }
+    rclcpp::Client<GetState>::SharedPtr client;
+    bool active{false}, pending{false};
+    double checked{-100.0}, requested{-100.0};
+    std::int64_t request_id{0};
+    std::uint64_t generation{0};
+  };
+
+  bool pose(const std::string & frame, Pose & p)
+  {
+    try {
+      const auto tf = tf_buffer_->lookupTransform(frame, "base_footprint", tf2::TimePointZero);
+      const double age = now().seconds() - rclcpp::Time(tf.header.stamp).seconds();
+      if (age > tf_timeout_ || age < -0.5) {return false;}
+      p.x = tf.transform.translation.x;
+      p.y = tf.transform.translation.y;
+      const auto & q = tf.transform.rotation;
+      p.yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+        1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+      return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.yaw);
+    } catch (const tf2::TransformException &) {return false;}
+  }
+
+  bool mapFresh() const
+  {
+    if (!map_) {return false;}
+    const double time = now().seconds();
+    const double age = time - rclcpp::Time(map_->header.stamp).seconds();
+    return time - map_received_ <= map_timeout_ && age <= map_timeout_ && age >= -0.5;
+  }
+
+  bool navigationActive()
+  {
+    const double time = now().seconds();
+    bool ready = true;
+    for (std::size_t i = 0; i < lifecycle_.size(); ++i) {
+      auto & check = lifecycle_[i];
+      if (check.pending && time - check.requested >= action_timeout_) {
+        check.client->remove_pending_request(check.request_id);
+        check.pending = false;
+        check.active = false;
+        ++check.generation;
       }
-    }
-    return c;
-  }
-  //判断一个区域是否可走
-  bool isFree(const nav_msgs::msg::OccupancyGrid& m,int x,int y) const
-  {
-    const int8_t v = m.data[y*m.info.width+x];
-    // -1未知区域 0 可走区域 100障碍物
-    return v>=0&&v<50;
-  }
-
-  bool isSafeGoalCell(const nav_msgs::msg::OccupancyGrid& m,int x,int y) const
-  {
-    if(!isFree(m,x,y))
-      return false;
-
-    const int w = static_cast<int>(m.info.width);
-    const int h = static_cast<int>(m.info.height);
-    for(int dx=-1;dx<=1;++dx)
-    {
-      for(int dy=-1;dy<=1;++dy)
-      {
-        const int nx=x+dx,ny=y+dy;
-        if(nx<0||nx>=w||ny<0||ny>=h) continue;
-        // 允许邻接未知格（前沿本身就是自由/未知交界），但不允许邻接障碍。
-        if(m.data[ny*w+nx] >= 65) return false;
-      }
-    }
-    return true;
-  }
-
-  bool isBlacklisted(double x,double y)
-  {
-    const auto now_time = now();
-    for(auto it=failed_goals_.begin(); it!=failed_goals_.end();)
-    {
-      if((now_time-it->time).seconds() > kFailedGoalCooldownSeconds)
-      {
-        it = failed_goals_.erase(it);
+      ready = ready && check.active && time - check.checked <= 5.0;
+      if (check.pending || time - check.requested < 2.0 || !check.client->service_is_ready()) {
         continue;
       }
-      if(std::hypot(x-it->x,y-it->y) < kFailedGoalRadius)
-        return true;
-      ++it;
+      check.pending = true;
+      check.requested = time;
+      const auto generation = ++check.generation;
+      check.request_id = check.client->async_send_request(std::make_shared<GetState::Request>(),
+        [this, i, generation](rclcpp::Client<GetState>::SharedFuture result) {
+          auto & item = lifecycle_[i];
+          if (item.generation != generation) {return;}
+          item.pending = false;
+          item.checked = now().seconds();
+          item.active = result.get()->current_state.id ==
+            lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+        }).request_id;
     }
-    return false;
+    return ready && nav_client_->action_server_is_ready() && plan_client_->action_server_is_ready();
   }
 
-  void recordFailure(double x,double y)
+  double freeArea() const
   {
-    const auto now_time = now();
-    for(auto &goal : failed_goals_)
+    return map_ ? maze_explorer::knownFreeCells(*map_) *
+      map_->info.resolution * map_->info.resolution : 0.0;
+  }
+
+  void updateObservationProgress()
+  {
+    if (map_revision_ == progress_map_revision_) {return;}
+    progress_map_revision_ = map_revision_;
+    const double area = freeArea();
+    if (area >= progress_area_ + 0.02) {
+      ++progress_epoch_;
+      progress_area_ = area;
+    }
+  }
+
+  bool excluded(double x, double y)
+  {
+    const double time = now().seconds();
+    return remembered_.blockedUntil(x, y, time, progress_epoch_) > time;
+  }
+
+  void remember(const Candidate & candidate, bool failed, bool no_progress = false)
+  {
+    remembered_.remember(candidate.x, candidate.y, now().seconds() + (failed ? 30.0 : 10.0),
+      failed ? 0.15 : 0.10, candidate.short_goal && no_progress, progress_epoch_);
+  }
+
+  geometry_msgs::msg::PoseStamped targetPose(const Candidate & candidate)
+  {
+    geometry_msgs::msg::PoseStamped target;
+    target.header.frame_id = "map";
+    target.header.stamp = now();
+    target.pose.position.x = candidate.x;
+    target.pose.position.y = candidate.y;
+    Pose robot;
+    const double yaw = pose("map", robot) ?
+      std::atan2(candidate.y - robot.y, candidate.x - robot.x) : 0.0;
+    target.pose.orientation.z = std::sin(yaw / 2.0);
+    target.pose.orientation.w = std::cos(yaw / 2.0);
+    return target;
+  }
+
+  std::uint64_t begin(Kind kind, Phase phase)
+  {
+    kind_ = kind;
+    op_started_ = now().seconds();
+    cancel_sent_ = false;
+    cancel_reason_.clear();
+    return operation_.begin(phase);
+  }
+
+  void tryNextCandidate()
+  {
+    if (operation_.phase() != Phase::Idle) {return;}
+    if (!mapFresh()) {return;}
+    if (candidate_index_ >= candidates_.size()) {
+      // Keep the short tier for the entire batch, independent of per-point cooldowns.
+      if (!short_candidates_.empty()) {
+        candidates_ = std::move(short_candidates_);
+        short_candidates_.clear();
+        candidate_index_ = 0;
+      } else {noCandidate(); return;}
+    }
+    candidate_ = candidates_[candidate_index_++];
+    if (excluded(candidate_.x, candidate_.y) ||
+      !maze_explorer::goalFootprintFree(*map_, candidate_.x, candidate_.y,
+        padded_radius_, goal_clearance_margin_))
     {
-      if(std::hypot(x-goal.x,y-goal.y) < kFailedGoalRadius)
+      // Do not recurse through a large frontier; continue at the next timer tick.
+      retry_candidates_ = true;
+      return;
+    }
+    retry_candidates_ = false;
+    ComputePath::Goal goal;
+    goal.goal = targetPose(candidate_);
+    goal.planner_id = "GridBased";
+    goal.use_start = false;
+    const auto token = begin(Kind::Plan, Phase::Planning);
+    auto options = rclcpp_action::Client<ComputePath>::SendGoalOptions();
+    options.goal_response_callback = [this, token](Handle<ComputePath>::SharedPtr handle) {
+      if (!operation_.accepts(token)) {
+        if (handle) {plan_client_->async_cancel_goal(handle);}
+        return;
+      }
+      if (!handle) {operation_.terminal(token); planFailed(); return;}
+      plan_handle_ = handle;
+      if (operation_.phase() == Phase::Canceling) {sendCancel();}
+    };
+    options.result_callback = [this, token](const Handle<ComputePath>::WrappedResult & result) {
+      if (!operation_.accepts(token)) {return;}
+      const bool canceled = operation_.phase() == Phase::Canceling;
+      operation_.terminal(token);
+      plan_handle_.reset();
+      if (canceled || result.code != rclcpp_action::ResultCode::SUCCEEDED ||
+        !result.result || result.result->error_code != ComputePath::Result::NONE ||
+        result.result->path.poses.empty() || !mapFresh())
       {
-        goal.time = now_time;
+        planFailed(); return;
+      }
+      const auto & path = result.result->path;
+      if (path.header.frame_id != "map") {planFailed(); return;}
+      const auto & end = path.poses.back().pose.position;
+      if (std::hypot(end.x - candidate_.x, end.y - candidate_.y) > 0.075 ||
+        !maze_explorer::goalFootprintFree(*map_, candidate_.x, candidate_.y,
+          padded_radius_, goal_clearance_margin_))
+      {
+        planFailed(); return;
+      }
+      double length = 0.0;
+      for (std::size_t i = 1; i < path.poses.size(); ++i) {
+        const auto & a = path.poses[i - 1].pose.position;
+        const auto & b = path.poses[i].pose.position;
+        if (!maze_explorer::segmentFootprintFree(*map_, a.x, a.y, b.x, b.y, padded_radius_)) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+            "规划路径的完整车体净空不足，检查同簇其他站位");
+          planFailed(); return;
+        }
+        length += std::hypot(b.x - a.x, b.y - a.y);
+      }
+      sendNavigation(length);
+    };
+    plan_client_->async_send_goal(goal, options);
+  }
+
+  void planFailed()
+  {
+    // A failed representative must not blacklist its entire frontier cluster.
+    remembered_.remember(candidate_.x, candidate_.y, now().seconds() + 10.0,
+      0.025, false, progress_epoch_);
+    retry_candidates_ = true;
+  }
+
+  void sendNavigation(double length)
+  {
+    Pose robot;
+    if (!mapFresh() || !pose("odom", robot)) {return;}
+    nav_start_ = robot;
+    nav_start_area_ = freeArea();
+    watchdog_.start(now().seconds(), robot.x, robot.y, length);
+    Navigate::Goal goal;
+    goal.pose = targetPose(candidate_);
+    const auto token = begin(Kind::Navigation, Phase::Sending);
+    auto options = rclcpp_action::Client<Navigate>::SendGoalOptions();
+    options.goal_response_callback = [this, token](Handle<Navigate>::SharedPtr handle) {
+      if (!operation_.accepts(token)) {
+        if (handle) {nav_client_->async_cancel_goal(handle);}
+        return;
+      }
+      if (!handle) {
+        operation_.terminal(token);
+        RCLCPP_WARN(get_logger(), "Nav2 拒绝目标；等待生命周期与地图就绪后重选");
+        retry_candidates_ = false;
+        return;
+      }
+      nav_handle_ = handle;
+      operation_.acknowledge(token);
+      if (operation_.phase() == Phase::Canceling) {sendCancel();}
+    };
+    options.result_callback = [this, token](const Handle<Navigate>::WrappedResult & result) {
+      if (!operation_.accepts(token)) {return;}
+      const bool canceled = operation_.phase() == Phase::Canceling;
+      operation_.terminal(token);
+      nav_handle_.reset();
+      Pose current;
+      const bool moved = pose("odom", current) &&
+        std::hypot(current.x - nav_start_.x, current.y - nav_start_.y) >= 0.05;
+      const bool observed = freeArea() >= nav_start_area_ + 0.01;
+      const bool progressed = moved || observed;
+      const bool succeeded = result.code == rclcpp_action::ResultCode::SUCCEEDED &&
+        result.result && result.result->error_code == Navigate::Result::NONE;
+      const bool novel_goal = succeeded && visited_goals_.mark(candidate_.x, candidate_.y);
+      if (progressed) {
+        ++progress_epoch_;
+      }
+      if (moved && novel_goal) {
+        recovery_used_ = false;
+        no_candidate_since_ = -1.0;
+      }
+      remember(candidate_, !succeeded, !progressed);
+      RCLCPP_INFO(get_logger(), "导航终止：%s，实际进展=%s，目标(%.2f,%.2f)",
+        succeeded ? "成功" : "失败/取消", progressed ? "有" : "无", candidate_.x, candidate_.y);
+      retry_candidates_ = false;
+      if (canceled || !succeeded) {
+        // Exhaust the remaining verified standpoints before spending recovery
+        // or declaring this entire frontier unreachable.
+        retry_candidates_ = true;
+      }
+    };
+    nav_client_->async_send_goal(goal, options);
+    RCLCPP_INFO(get_logger(), "探索%s目标(%.2f,%.2f)，已验证路径 %.2fm",
+      candidate_.short_goal ? "短距" : "", candidate_.x, candidate_.y, length);
+  }
+
+  void requestCancel(const std::string & reason)
+  {
+    if (operation_.phase() == Phase::Canceling || operation_.phase() == Phase::Idle) {return;}
+    cancel_reason_ = reason;
+    cancel_started_ = now().seconds();
+    operation_.cancel(operation_.generation());
+    RCLCPP_WARN(get_logger(), "取消当前 action：%s；收到终止结果前不执行恢复", reason.c_str());
+    sendCancel();
+  }
+
+  void sendCancel()
+  {
+    if (cancel_sent_) {return;}
+    if (kind_ == Kind::Plan && plan_handle_) {plan_client_->async_cancel_goal(plan_handle_);}
+    else if (kind_ == Kind::Navigation && nav_handle_) {nav_client_->async_cancel_goal(nav_handle_);}
+    else if (kind_ == Kind::Backup && backup_handle_) {backup_client_->async_cancel_goal(backup_handle_);}
+    else if (kind_ == Kind::Spin && spin_handle_) {spin_client_->async_cancel_goal(spin_handle_);}
+    else {return;}  // The request can time out before the goal response arrives.
+    cancel_sent_ = true;
+  }
+
+  bool recoverySensorsReady()
+  {
+    if (!scan_ || scan_->ranges.size() < 36 || scan_->header.frame_id.empty()) {return false;}
+    const auto & scan = *scan_;
+    const double age = now().seconds() - rclcpp::Time(scan.header.stamp).seconds();
+    if (age < -0.1 || age > recovery_scan_timeout_ ||
+      now().seconds() - scan_received_ > recovery_scan_timeout_ ||
+      !std::isfinite(scan.angle_min) || !std::isfinite(scan.angle_max) ||
+      !std::isfinite(scan.angle_increment) || scan.angle_increment <= 0.0 ||
+      !std::isfinite(scan.range_min) || !std::isfinite(scan.range_max) ||
+      scan.range_min < 0.0 || scan.range_max <= scan.range_min)
+    {return false;}
+    const double span = (scan.ranges.size() - 1) * static_cast<double>(scan.angle_increment);
+    if (span < 2.0 * std::acos(-1.0) - 2.0 * scan.angle_increment ||
+      std::abs(scan.angle_max - scan.angle_min - span) > 2.0 * scan.angle_increment)
+    {return false;}
+    for (const auto range : scan.ranges) {
+      // Positive infinity is a valid no-return beam. NaN/negative infinity and
+      // out-of-range finite returns leave unseen sectors and cannot permit recovery.
+      if (std::isnan(range) || range < scan.range_min ||
+        (std::isfinite(range) && range > scan.range_max)) {return false;}
+    }
+    return tf_buffer_->canTransform("odom", scan.header.frame_id,
+      rclcpp::Time(scan.header.stamp), rclcpp::Duration::from_seconds(0.0));
+  }
+
+  void startRecovery()
+  {
+    if (operation_.phase() != Phase::Idle) {return;}
+    if (recovery_used_) {no_candidate_since_ = now().seconds(); return;}
+    if (!recoverySensorsReady() || !navigationActive()) {
+      waitForImprovement("恢复等待新鲜完整 360° 激光、有效 TF 和 active 的 Nav2；保持静止");
+      return;
+    }
+    recovery_used_ = true;
+    // Nav2 checks the complete swept footprint against the odom-frame live
+    // obstacle layer. A displaced global SLAM wall must not veto that check.
+    if (!backup_client_->action_server_is_ready()) {startSpin(); return;}
+    BackUp::Goal goal;
+    goal.target.x = -0.15;
+    goal.speed = 0.05;  // BackUp accepts a positive speed magnitude.
+    goal.time_allowance = rclcpp::Duration::from_seconds(8.0);
+    const auto token = begin(Kind::Backup, Phase::BackingUp);
+    auto options = rclcpp_action::Client<BackUp>::SendGoalOptions();
+    options.goal_response_callback = [this, token](Handle<BackUp>::SharedPtr handle) {
+      if (!operation_.accepts(token)) {
+        if (handle) {backup_client_->async_cancel_goal(handle);}
+        return;
+      }
+      if (!handle) {operation_.terminal(token); recoveryFinished(); return;}
+      backup_handle_ = handle;
+      if (operation_.phase() == Phase::Canceling) {sendCancel();}
+    };
+    options.result_callback = [this, token](const Handle<BackUp>::WrappedResult & result) {
+      if (!operation_.accepts(token)) {return;}
+      const bool canceled = operation_.phase() == Phase::Canceling;
+      operation_.terminal(token);
+      backup_handle_.reset();
+      if (!canceled && result.code == rclcpp_action::ResultCode::SUCCEEDED &&
+        result.result && result.result->error_code == BackUp::Result::NONE) {startSpin();}
+      else {recoveryFinished();}
+    };
+    backup_client_->async_send_goal(goal, options);
+    RCLCPP_INFO(get_logger(), "安全恢复：Nav2 BackUp 0.15m / 0.05m/s");
+  }
+
+  void startSpin()
+  {
+    if (!recoverySensorsReady() || !navigationActive() ||
+      !spin_client_->action_server_is_ready()) {recoveryFinished(); return;}
+    Spin::Goal goal;
+    goal.target_yaw = static_cast<float>(std::acos(-1.0));
+    goal.time_allowance = rclcpp::Duration::from_seconds(20.0);
+    const auto token = begin(Kind::Spin, Phase::Spinning);
+    auto options = rclcpp_action::Client<Spin>::SendGoalOptions();
+    options.goal_response_callback = [this, token](Handle<Spin>::SharedPtr handle) {
+      if (!operation_.accepts(token)) {
+        if (handle) {spin_client_->async_cancel_goal(handle);}
+        return;
+      }
+      if (!handle) {operation_.terminal(token); recoveryFinished(); return;}
+      spin_handle_ = handle;
+      if (operation_.phase() == Phase::Canceling) {sendCancel();}
+    };
+    options.result_callback = [this, token](const Handle<Spin>::WrappedResult & result) {
+      if (!operation_.terminal(token)) {return;}
+      spin_handle_.reset();
+      RCLCPP_INFO(get_logger(), "旋转恢复终止，action 状态=%d", static_cast<int>(result.code));
+      recoveryFinished();
+    };
+    spin_client_->async_send_goal(goal, options);
+    RCLCPP_INFO(get_logger(), "安全恢复：Nav2 Spin π rad，受统一限速和碰撞检查约束");
+  }
+
+  void recoveryFinished()
+  {
+    retry_candidates_ = false;
+    no_candidate_since_ = now().seconds();
+    RCLCPP_INFO(get_logger(), "恢复结束，等待新地图并重新选择前沿");
+  }
+
+  void noCandidate()
+  {
+    retry_candidates_ = false;
+    const double time = now().seconds();
+    if (operation_.phase() == Phase::Waiting) {
+      // A missing scan may have deferred the first recovery. Once that input
+      // returns, allow it once; map republishes never replenish the budget.
+      if (!recovery_used_ && recoverySensorsReady() && navigationActive()) {
+        operation_.resume();
+        startRecovery();
+      }
+      return;
+    }
+    if (no_candidate_since_ < 0) {no_candidate_since_ = time;}
+    Pose robot;
+    if (mapFresh() && pose("map", robot) && time - no_candidate_since_ < 60.0) {
+      const auto geometric = maze_explorer::findCandidates(*map_, robot.x, robot.y,
+        padded_radius_, {}, goal_clearance_margin_);
+      double retry_at = std::numeric_limits<double>::infinity();
+      const auto consider = [&](const auto & candidates) {
+          for (const auto & c : candidates) {
+            const double until = remembered_.blockedUntil(c.x, c.y, time, progress_epoch_);
+            if (until > time && std::isfinite(until)) {retry_at = std::min(retry_at, until);}
+          }
+        };
+      consider(geometric.candidates);
+      consider(geometric.short_candidates);
+      if (std::isfinite(retry_at) && retry_at - no_candidate_since_ <= 60.0) {
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+          "安全候选仍在冷却，约 %.1f 秒后可重试；暂不判定停滞", retry_at - time);
         return;
       }
     }
-    failed_goals_.push_back({x,y,now_time});
+    // Allow map updates and the exact-point planning cooldown to expire before moving.
+    if (time - no_candidate_since_ < (recovery_used_ ? 12.0 : 10.0)) {return;}
+    if (!recovery_used_) {startRecovery();}
+    else {waitForImprovement("仍有未知前沿，但安全站位/路径不可达；有界恢复后等待地图或位姿改善");}
   }
 
-  void clearCostmaps()
-  {
-    if(clear_costmap_client_->service_is_ready())
-    {
-      auto request = std::make_shared<nav2_msgs::srv::ClearEntireCostmap::Request>();
-      clear_costmap_client_->async_send_request(request);
-    }
-    if(clear_local_costmap_client_->service_is_ready())
-    {
-      auto request = std::make_shared<nav2_msgs::srv::ClearEntireCostmap::Request>();
-      clear_local_costmap_client_->async_send_request(request);
-    }
-  }
-
-  bool robotPose(double& x,double& y)
-  {
-    try
-    {
-      // 查 TF 获取机器人在 map 坐标系下的当前坐标
-      const auto t = tf_buffer_->lookupTransform(
-        "map","base_footprint",tf2::TimePointZero,200ms);
-      x = t.transform.translation.x;
-      y = t.transform.translation.y;
-      return true;
-    }
-    catch(const tf2::TransformException& e)
-    {
-      return false;
-    }
-  }
-  // 统计可走区域的面积（仅用于打印日志）
-  int countFree(const nav_msgs::msg::OccupancyGrid& m) const
-  {
-    int c=0;
-    for(const int8_t v : m.data)
-     if(v>=0&&v<50) c++;
-    return c;
-  }
-  // 发送导航目标给 Nav2
-  void sendGoal(double x,double y)
-  {
-    if(!nav_client_->action_server_is_ready())
-    {
-      RCLCPP_WARN(get_logger(),"Nav2 未就绪");
-      return;
-    }
-    NavigateToPose::Goal goal;
-    goal.pose.header.frame_id = "map";
-    goal.pose.header.stamp = now();
-    goal.pose.pose.position.x = x;
-    goal.pose.pose.position.y = y;
-    goal.pose.pose.orientation.w = 1.0;
-
-    auto options = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
-    options.goal_response_callback =
-      [this](const GoalHandleNav::SharedPtr &handle) {
-        if (!handle) {
-          RCLCPP_WARN(get_logger(), "目标被 Nav2 拒绝");
-          state_ = State::kIdle;   // 不恢复就永远卡死
-        }
-      };
-    options.result_callback =
-      [this](const GoalHandleNav::WrappedResult& result)
-      {
-      if(result.code == rclcpp_action::ResultCode::SUCCEEDED) {
-            RCLCPP_INFO(get_logger(),"到达目标");
-            consecutive_failures_ = 0;
-      }
-      else {
-        RCLCPP_WARN(get_logger(),"探索失败/被取消，将目标 (%.2f,%.2f) 拉黑 30 秒并清空代价地图",
-          last_goal_x_,last_goal_y_);
-        recordFailure(last_goal_x_,last_goal_y_);
-        clearCostmaps();
-        ++consecutive_failures_;
-        if(consecutive_failures_ >= kMaxConsecutiveFailures)
-        {
-          finish("连续导航目标失败，剩余前沿可能不可达");
-        }
-      }
-      state_ = State::kIdle;
-      };
-    state_ = State::kNavigating;
-    last_goal_x_ = x;
-    last_goal_y_ = y;
-    last_goal_time_ = now();
-    unreachable_streak_ = 0;
-    nav_client_ ->async_send_goal(goal,options);
-    RCLCPP_INFO(get_logger(),"探索（%.2f,%.2f）",x,y);
-  }
-
-  void finish(const std::string& reason)
-  {
-    RCLCPP_INFO(get_logger(),"探索结束：%s",reason.c_str());
-    if(saveMap())
-    {
-      RCLCPP_INFO(get_logger(),"地图已保存：%s.pgm/.yaml",map_save_path_.c_str());
-    }
-    else
-    {
-      RCLCPP_ERROR(get_logger(),"地图保存失败");
-    }
-    timer_->cancel();
-  }
-
-  bool saveMap() const
-  {
-    if(!map_)
-      return false;
-    const auto& m=*map_;
-    const int w = m.info.width,h = m.info.height;
-    std::ofstream pgm(map_save_path_+".pgm",std::ios::binary);
-    if(!pgm) return false;
-    pgm << "P5\n" << w << " " << h << "\n255\n";
-    // OccupancyGrid data[0] 是左下角；PGM 第一行是图像最上方 → 行倒序写!
-    for (int y = h - 1; y >= 0; --y)
-    {
-      for (int x = 0; x < w; ++x) {
-        const int8_t v = m.data[y * w + x];
-        uint8_t pixel = (v < 0) ? 205 : (v >= 50 ? 0 : 254);  // 未知/占据/自由
-        pgm.put(static_cast<char>(pixel));
-      }
-    }
-    pgm.close();
-
-    std::ofstream yaml(map_save_path_ + ".yaml");
-    if (!yaml) return false;
-    yaml << "image: explored_maze.pgm\n"          // 只写文件名,不写路径!
-        << "resolution: " << m.info.resolution << "\n"
-        << "origin: [" << m.info.origin.position.x << ", "
-        << m.info.origin.position.y << ", 0.0]\n"
-        << "negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.25\n";
-    return true;
-  }
-  // 核心决策逻辑：找出所有前沿簇，选最近的走过去
   void decide()
   {
-    if(!map_)
-    {
-      RCLCPP_INFO(get_logger(),"等待地图");
+    if (!mapFresh()) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "等待新鲜 /map；尚不发送探索目标");
       return;
     }
-    double rx=0.0,ry=0.0;
-    if(!robotPose(rx,ry))
-    {
-      RCLCPP_WARN(get_logger(),"查不到TF");
+    if (!navigationActive()) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "等待 Nav2 生命周期节点全部 active");
       return;
     }
-    RCLCPP_INFO(get_logger(),"地图：%ux%u 可走区域面积:%d 前沿格数:%d 机器人坐标（%.2f,%.2f）",
-      map_->info.width,map_->info.height,countFree(*map_),countFrontiers(*map_),rx,ry);
-
-    const auto &m = *map_;
-    const double ox = m.info.origin.position.x;
-    const double oy = m.info.origin.position.y;
-    const double res = m.info.resolution;
-
-    const auto clusters = findClusters(m,min_frontier_size_);
-    if(clusters.empty())
-    {
-      empty_streak++;
-      unreachable_streak_ = 0;
-      RCLCPP_INFO(get_logger(),"没有任何前沿簇(连续%d/%d轮)",empty_streak,finish_after_empty_);
-      if(empty_streak>=finish_after_empty_)
-      {
-        finish("地图没有任何未知前沿了");
-      }
+    Pose robot;
+    if (!pose("map", robot) || !pose("odom", robot_odom_)) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "等待新鲜 map/odom 到 base_footprint 的 TF");
       return;
     }
-    empty_streak = 0;
-
-    int rcx = static_cast<int>((rx-ox)/res);
-    int rcy = static_cast<int>((ry-oy)/res);
-    const auto dist = bfsDistanceField(m,rcx,rcy);
-    std::vector<Frontier> candidates;
-    for(const auto& cluster : clusters)
-    {
-      Frontier f;
-      double best_d = std::numeric_limits<double>::max();
-      int best_x = -1;
-      int best_y = -1;
-      for(const auto &[x,y]:cluster)
-      {
-        if(!isSafeGoalCell(m,x,y))
-          continue;
-        const double d = static_cast<double>(dist[y*m.info.width+x]);
-        if(!std::isfinite(d) || d >= best_d)
-          continue;
-        best_d = d;
-        best_x = x;
-        best_y = y;
+    if (retry_candidates_) {tryNextCandidate(); return;}
+    const auto result = maze_explorer::findCandidates(*map_, robot.x, robot.y,
+      padded_radius_, [this](double x, double y) {return excluded(x, y);},
+      goal_clearance_margin_);
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+      "前沿筛选：原始=%zu 簇=%zu 小簇=%zu 可达格=%zu 不可达前沿=%zu 冷却/锁定=%zu 过近=%zu 起点自由=%d 车体净空=%d",
+      result.frontier_cells, result.frontier_clusters, result.small_clusters,
+      result.reachable_cells, result.unreachable_frontiers, result.excluded_standpoints,
+      result.too_close_standpoints, result.robot_in_known_free, result.robot_footprint_free);
+    if (!result.robot_in_known_free) {empty_maps_ = 0; noCandidate(); return;}
+    if (result.frontier_cells == 0) {
+      if (last_empty_revision_ != map_revision_) {
+        last_empty_revision_ = map_revision_;
+        ++empty_maps_;
       }
-      if(best_x < 0 || !std::isfinite(best_d))
-        continue;
-      f.goal_x = ox+(best_x+0.5)*res;
-      f.goal_y = oy+(best_y+0.5)*res;
-      f.centroid_x = f.goal_x;
-      f.centroid_y = f.goal_y;
-      f.path_dist = best_d;
-      candidates.push_back(f);
-    }
-    std::vector<Frontier> filtered;
-    const auto current_time = now();
-    for(const auto& f : candidates)
-    {
-      // 机器人已经站在这片前沿附近时，重复发送同一目标只会让 Nav2
-      // 反复判定“到达目标”，造成原地打转。
-      if(f.path_dist < kMinFrontierGoalDistance)
-        continue;
-      if(isBlacklisted(f.goal_x,f.goal_y))
-        continue;
-      const double since_last_goal = (current_time - last_goal_time_).seconds();
-      if(std::hypot(f.goal_x - last_goal_x_, f.goal_y - last_goal_y_) <
-           kRecentGoalRadius &&
-         since_last_goal < kRecentGoalCooldownSeconds)
-        continue;
-      filtered.push_back(f);
-    }
-    if(filtered.empty())
-    {
-      if (unreachable_streak_ < 5) {
-        RCLCPP_INFO(get_logger(), "没有可达前沿，触发倒车脱困 (%d/5)", unreachable_streak_ + 1);
-        state_ = State::kSpinning; // 借用 spinning 状态，但在回调里执行倒车
-        spin_ticks_ = 20; // 倒车 2 秒
-        spin_timer_->reset();
-        ++unreachable_streak_;
-        return;
-      }
-
-      ++unreachable_streak_;
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-        "倒车后仍没有可达前沿（连续%d/%d轮），等待地图更新",
-        unreachable_streak_,kFinishAfterUnreachable);
-      if(unreachable_streak_ >= kFinishAfterUnreachable)
-      {
-        finish("连续多轮没有可达前沿");
-      }
+      if (empty_maps_ >= 5) {finish(true, "连续五张新鲜地图没有未知前沿");}
       return;
     }
-
-    const auto best = *std::min_element(filtered.begin(),filtered.end(),
-      [](const Frontier& a, const Frontier& b){return a.path_dist<b.path_dist;});
-
-    sendGoal(best.goal_x,best.goal_y);
-  }
-
-  // 求小车到地图所有点的距离
-  std::vector<float> bfsDistanceField(const nav_msgs::msg::OccupancyGrid& m,int sx,int sy) const
-  {
-    const int w = m.info.width,h = m.info.height;
-    const float inf = std::numeric_limits<float>::infinity();
-    std::vector<float> dist(w*h,inf);
-    //如果起点被卡在墙里，在附近 3x3 或 5x5 区域内找一个新的起点
-    if (!isFree(m, sx, sy)) {
-        bool found = false;
-        for (int r = 1; r <= 5 && !found; ++r) {
-            for (int dx = -r; dx <= r && !found; ++dx) {
-                for (int dy = -r; dy <= r && !found; ++dy) {
-                    if (isFree(m, sx + dx, sy + dy)) {
-                        sx += dx;
-                        sy += dy;
-                        found = true;
-                        RCLCPP_INFO(get_logger(), "起点被占据，BFS 起点自动偏移至安全点");
-                    }
-                }
-            }
-        }
-        if (!found) return dist; // 如果附近真全是墙，直接返回全 inf
+    empty_maps_ = 0;
+    candidates_ = result.candidates;
+    short_candidates_ = !candidates_.empty() && !candidates_.front().short_goal ?
+      result.short_candidates : std::vector<Candidate>{};
+    candidate_index_ = 0;
+    if (candidates_.empty()) {noCandidate(); return;}
+    if (operation_.resume()) {
+      no_candidate_since_ = -1.0;
+      writeStatus("exploring", false, "安全候选重新出现，恢复探索", false);
+      RCLCPP_INFO(get_logger(), "安全候选重新出现，恢复探索；恢复次数仅在新的实际进展后重置");
     }
-    std::queue<std::pair<int,int>> q;
-    dist[sy*w+sx]=0.0f;
-    q.emplace(sx,sy);
-    while(!q.empty())
-    {
-      const auto [x,y] = q.front();
-      q.pop();
-      const float d=dist[y*w+x];
-      for(const auto &[dx,dy] : kDirs4)
-      {
-        const int nx=x+dx,ny=y+dy;
-        if(nx<0||nx>=w||ny<0||ny>=h) continue;
-        if(dist[ny*w+nx]!=inf||!isFree(m,nx,ny))continue;
-        dist[ny*w+nx] = d+m.info.resolution;
-        q.emplace(nx,ny);
-      }
-    }
-    return dist;
-  }
-
-  std::vector<std::vector<std::pair<int,int>>> findClusters(const nav_msgs::msg::OccupancyGrid& m,int min_size)const
-  {
-    const int w = m.info.width,h = m.info.height;
-    std::vector<char> isfrontier(w*h,0);
-    for(int x=0;x<w;x++)
-    {
-      for(int y=0;y<h;y++)
-      {
-        if(!isFree(m,x,y))
-          continue;
-        for(const auto &[dx,dy]:kDirs8)
-        {
-          const int nx=x+dx,ny=y+dy;
-          if(nx<0||nx>=w||ny<0||ny>=h) continue;
-          if(m.data[ny*w+nx]<0)
-          {
-            isfrontier[y*w+x]=1;
-            break;
-          }
-        }
-      }
-    }
-
-    std::vector<char> visited(w*h,0);
-    std::vector<std::vector<std::pair<int,int>>> clusters;
-    for(int x=0;x<w;x++)
-    {
-      for(int y=0;y<h;y++)
-      {
-        if(!isfrontier[y*w+x] || visited[y*w+x])
-          continue;
-        std::vector<std::pair<int,int>> cluster;
-        std::queue<std::pair<int,int>> q;
-        visited[y*w+x]=1;
-        q.emplace(x,y);
-        while(!q.empty())
-        {
-          const auto [cx,cy] = q.front();
-          q.pop();
-          cluster.emplace_back(cx,cy);
-          for(const auto &[dx,dy]:kDirs8)
-          {
-            const int nx=cx+dx,ny=cy+dy;
-            if(nx<0||nx>=w||ny<0||ny>=h) continue;
-            if(!isfrontier[ny*w+nx]||visited[ny*w+nx]) continue;
-            visited[ny*w+nx]=1;
-            q.emplace(nx,ny);
-          }
-        }
-        if(static_cast<int>(cluster.size())>=min_size)
-        {
-          clusters.push_back(cluster);
-        }
-      }
-    }
-    return clusters;
+    RCLCPP_INFO(get_logger(), "前沿格 %zu，安全%s候选 %zu，机器人(%.2f,%.2f)",
+      result.frontier_cells, candidates_.front().short_goal ? "短距" : "普通",
+      candidates_.size(), robot.x, robot.y);
+    tryNextCandidate();
   }
 
   void onTimer()
   {
-    // 只有在空闲状态才做决策
-    if(state_ != State::kIdle) return;
-    decide();
-  }
-
-  // 自旋回调函数(执行倒车)
-  void spinCallback()
-  {
-    if (spin_ticks_ > 0) {
-      auto cmd = geometry_msgs::msg::Twist();
-      cmd.linear.x = -0.15; // 负数代表倒车，速度 0.15 m/s
-      cmd.angular.z = 0.0;  // 不转动
-      cmd_vel_pub_->publish(cmd);
-      spin_ticks_--;
-    } else {
-      auto cmd = geometry_msgs::msg::Twist(); // 停止
-      cmd_vel_pub_->publish(cmd);
-      spin_timer_->cancel();
-      state_ = State::kIdle;
-      last_goal_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-      RCLCPP_INFO(get_logger(), "倒车脱困结束，重新规划...");
+    if (operation_.phase() == Phase::Finished) {return;}
+    const double time = now().seconds();
+    if (last_tick_ >= 0 && time < last_tick_) {
+      finish(false, "仿真时钟回退；请重启探索以清除旧目标与地图");
+      return;
+    }
+    last_tick_ = time;
+    updateObservationProgress();
+    const auto phase = operation_.phase();
+    if (phase == Phase::Canceling) {
+      sendCancel();
+      if (time - cancel_started_ >= action_timeout_) {
+        finish(false, "取消未收到终止确认；保留控制权，不启动新的运动");
+      }
+      return;
+    }
+    if (phase == Phase::Idle || phase == Phase::Waiting) {
+      if (time - last_decision_ >= 2.0) {last_decision_ = time; decide();}
+      return;
+    }
+    if (!mapFresh()) {requestCancel("地图过期"); return;}
+    if ((phase == Phase::BackingUp || phase == Phase::Spinning) &&
+      (!recoverySensorsReady() || !navigationActive()))
+    {requestCancel("恢复期间激光/TF 过期或 Nav2 非 active"); return;}
+    if (phase == Phase::Planning && time - op_started_ >= planning_timeout_) {
+      requestCancel("规划超时"); return;
+    }
+    if (phase == Phase::Sending && time - op_started_ >= action_timeout_) {
+      requestCancel("导航目标确认超时"); return;
+    }
+    if (phase == Phase::Navigating) {
+      Pose odom;
+      if (!pose("odom", odom)) {requestCancel("里程计 TF 过期"); return;}
+      watchdog_.observe(time, odom.x, odom.y);
+      if (watchdog_.noProgress(time)) {requestCancel("30 秒无足够平移进展");}
+      else if (watchdog_.totalExpired(time)) {requestCancel("单目标总时限到达");}
+    }
+    if ((phase == Phase::BackingUp || phase == Phase::Spinning) &&
+      time - op_started_ >= (phase == Phase::BackingUp ? 10.0 : 25.0))
+    {
+      requestCancel("恢复 action 超时");
     }
   }
-private:
-  rclcpp::Client<nav2_msgs::srv::ClearEntireCostmap>::SharedPtr clear_costmap_client_;
-  rclcpp::Client<nav2_msgs::srv::ClearEntireCostmap>::SharedPtr clear_local_costmap_client_;
+
+  bool saveMap() const
+  {
+    if (!map_) {return false;}
+    const auto & map = *map_;
+    std::ofstream pgm(save_path_ + ".pgm", std::ios::binary);
+    if (!pgm) {return false;}
+    pgm << "P5\n" << map.info.width << ' ' << map.info.height << "\n255\n";
+    for (int y = static_cast<int>(map.info.height) - 1; y >= 0; --y) {
+      for (std::uint32_t x = 0; x < map.info.width; ++x) {
+        const auto value = map.data[y * map.info.width + x];
+        pgm.put(static_cast<char>(value < 0 ? 205 : value >= 50 ? 0 : 254));
+      }
+    }
+    pgm.close();
+    if (!pgm) {return false;}
+    std::ofstream yaml(save_path_ + ".yaml");
+    const auto & q = map.info.origin.orientation;
+    const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+      1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    const auto basename = save_path_.substr(save_path_.find_last_of('/') + 1);
+    yaml << "image: " << std::quoted(basename + ".pgm") << "\nresolution: " <<
+      map.info.resolution << "\norigin: [" << map.info.origin.position.x << ", " <<
+      map.info.origin.position.y << ", " << yaw << "]\nnegate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.25\n";
+    yaml.close();
+    return static_cast<bool>(yaml);
+  }
+
+  void writeStatus(
+    const std::string & state, bool completed, const std::string & reason, bool save)
+  {
+    const bool saved = save ? saveMap() : false;
+    std::ofstream status(save_path_ + ".status.yaml");
+    status << "status: " << state << "\ncompleted: " << (completed ? "true" : "false") <<
+      "\nreason: " << std::quoted(reason) << "\nresumable: " <<
+      (operation_.phase() == Phase::Waiting ? "true" : "false") <<
+      "\nmap_saved: " << (saved ? "true" : "false") <<
+      "\nsimulation_time: " << now().seconds() << '\n';
+  }
+
+  void waitForImprovement(const std::string & reason)
+  {
+    if (!operation_.wait()) {return;}
+    retry_candidates_ = false;
+    writeStatus("stalled", false, reason, true);
+    RCLCPP_WARN(get_logger(), "探索暂停（未完成，可恢复）：%s；保持监测新地图，不重复强行恢复",
+      reason.c_str());
+  }
+
+  void finish(bool completed, const std::string & reason)
+  {
+    if (operation_.phase() == Phase::Finished) {return;}
+    // No recovery is dispatched after this point; late goal responses are canceled by callbacks.
+    if (operation_.phase() != Phase::Idle && operation_.phase() != Phase::Waiting) {sendCancel();}
+    operation_.finish();
+    timer_->cancel();
+    writeStatus(completed ? "completed" : "stalled", completed, reason, true);
+    RCLCPP_INFO(get_logger(), "%s：%s；地图保存结果见 %s.status.yaml",
+      completed ? "探索完成" : "探索终止（未完成）", reason.c_str(), save_path_.c_str());
+  }
+
+  std::string save_path_;
+  double padded_radius_, goal_clearance_margin_, map_timeout_, tf_timeout_;
+  double action_timeout_, planning_timeout_, recovery_scan_timeout_;
+  double scan_received_{-100.0};
+  double map_received_{-100.0}, op_started_{0.0}, cancel_started_{0.0};
+  double last_tick_{-1.0}, last_decision_{-100.0}, no_candidate_since_{-1.0};
+  double nav_start_area_{0.0}, progress_area_{0.0};
+  std::string cancel_reason_;
+  bool cancel_sent_{false}, retry_candidates_{false}, recovery_used_{false};
+  Kind kind_{Kind::Plan};
+  int empty_maps_{0};
+  std::uint64_t map_revision_{0}, last_empty_revision_{0}, progress_map_revision_{0}, progress_epoch_{0};
+  Pose nav_start_, robot_odom_;
+  Candidate candidate_{};
+  std::vector<Candidate> candidates_;
+  std::vector<Candidate> short_candidates_;
+  std::size_t candidate_index_{0};
+  maze_explorer::GoalExclusions remembered_;
+  std::vector<LifecycleCheck> lifecycle_;
+  maze_explorer::OperationTracker operation_;
+  maze_explorer::ProgressWatchdog watchdog_;
+  maze_explorer::VisitedGoals visited_goals_;
   rclcpp::TimerBase::SharedPtr timer_;
-  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   nav_msgs::msg::OccupancyGrid::SharedPtr map_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
-
-  //自旋相关变量
-  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
-  rclcpp::TimerBase::SharedPtr spin_timer_;
-  int spin_ticks_ = 0;
-  enum class State { kIdle, kNavigating, kSpinning };
-  //enum class State { kIdle,kNavigating };
-  State state_ = State::kIdle;
-  rclcpp_action::Client<NavigateToPose>::SharedPtr nav_client_;
-  std::vector<FailedGoal> failed_goals_;
-  int min_frontier_size_ = 5;
-  int empty_streak = 0;
-  int unreachable_streak_ = 0;
-  int consecutive_failures_ = 0;
-  int finish_after_empty_;
-  double last_goal_x_ = std::numeric_limits<double>::infinity();
-  double last_goal_y_ = std::numeric_limits<double>::infinity();
-  rclcpp::Time last_goal_time_{0, 0, RCL_ROS_TIME};
-  std::string map_save_path_="explorer_maze";
+  sensor_msgs::msg::LaserScan::SharedPtr scan_;
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  rclcpp_action::Client<Navigate>::SharedPtr nav_client_;
+  rclcpp_action::Client<ComputePath>::SharedPtr plan_client_;
+  rclcpp_action::Client<BackUp>::SharedPtr backup_client_;
+  rclcpp_action::Client<Spin>::SharedPtr spin_client_;
+  Handle<Navigate>::SharedPtr nav_handle_;
+  Handle<ComputePath>::SharedPtr plan_handle_;
+  Handle<BackUp>::SharedPtr backup_handle_;
+  Handle<Spin>::SharedPtr spin_handle_;
 };
 
-int main(int argc, char **argv) {
+int main(int argc, char ** argv)
+{
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<ExplorerNode>());
   rclcpp::shutdown();

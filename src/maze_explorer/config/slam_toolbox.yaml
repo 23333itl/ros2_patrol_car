@@ -9,25 +9,35 @@ slam_toolbox:
     map_frame: map
     scan_topic: /scan
     mode: mapping
+    # 正式基线保持激光匹配；对照配置通过 slam_profile 显式选择。
+    use_scan_matching: true
     # 雷达量程与 bot 的 gpu_lidar 配置一致
     max_laser_range: 8.0
     resolution: 0.05
-    # 降低完整地图发布频率，避免 RViz 反复重建地图造成卡顿
-    map_update_interval: 2.0
+    # 地图 1s 发布一次：脚下区域尽快变成自由格，
+    # 避免探索节点/规划器拿着滞后地图把机器人判成“站在墙里”
+    map_update_interval: 1.0
     transform_publish_period: 0.05
-    # 10Hz 雷达下 0.5s 足够；太长反而会拿过期 TF 做匹配
-    minimum_time_interval: 0.2
+    # 10 Hz 雷达下最多每 0.1 s 处理一次扫描。
+    minimum_time_interval: 0.1
     transform_timeout: 0.5
     tf_buffer_duration: 30.0
-    # 降低建图触发频率，省 CPU：挪动 10cm 或转过 0.05 rad 才处理一帧
-    minimum_travel_distance: 0.08
-    minimum_travel_heading: 0.05
-    controller_frequency: 20.0  # 默认 10.0，翻倍，车走得更平滑
+    # 2.8.5 的前置筛选默认主要检查平移；单设 heading 不保证原地转动处理扫描。
+    # *_turn 候选启用 check_min_dist_and_heading_precisely 后，才按距离或转角触发。
+    minimum_travel_distance: 0.05
+    minimum_travel_heading: 0.03
     throttle_scans: 1
-    # 迷宫走廊纹理高度重复，误回环会把地图瞬间修烂（重影墙封死走廊），
-    # 且 EKF（轮速+IMU）里程计在小迷宫里精度足够，直接关掉回环
+    # 对称迷宫存在误回环风险，当前保留关闭；累积漂移仍会影响地图与导航。
+    # 后续需用轨迹真值与重复走廊场景验证，再单独评估启用回环。
     do_loop_closing: false
-     # 放宽扫描匹配器的搜索空间（防止车转太快，稍微偏一点就找不到了）
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 2.0
+    loop_match_minimum_response_coarse: 0.55
+    loop_match_minimum_response_fine: 0.65
+    loop_search_space_resolution: 0.05
+    loop_search_space_dimension: 4.0
+    # 迷宫单步运动很小，0.3 m 足以覆盖相邻关键帧；扩大到 0.5 m 会在
+    # 重复走廊中增加错误平移候选，也会提高每次匹配的计算量。
     correlation_search_space_dimension: 0.3
     correlation_search_space_resolution: 0.01
     loop_search_maximum_distance: 4.0

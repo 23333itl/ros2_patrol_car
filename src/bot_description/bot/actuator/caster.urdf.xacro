@@ -29,10 +29,13 @@
             <child link="${caster_name}_caster_link"/>
             <origin xyz="${xyz}"/>
     </joint>
-    <!-- 万向球只承担支撑，摩擦要低，避免两个固定球拖住差速底盘 -->
+    <!-- 万向球只承担支撑：它们是 fixed 关节、只能横滑，
+         摩擦必须接近零，否则差速原地转向时两个球的滑动阻力
+         会抵消电机扭矩，车在转角就转不动（卡住）。
+         0.2 -> 0.01，让原地旋转顺畅。 -->
     <gazebo reference="${caster_name}_caster_link">
-        <mu1 value="0.2"/>
-        <mu2 value="0.2"/>
+        <mu1 value="0.01"/>
+        <mu2 value="0.01"/>
         <kp value="1000000.0"/>
         <kd value="10.0"/>
     </gazebo>
