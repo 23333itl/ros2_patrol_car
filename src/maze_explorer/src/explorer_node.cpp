@@ -53,12 +53,14 @@ public:
     tf_timeout_ = declare_parameter("tf_timeout", 2.0);
     action_timeout_ = declare_parameter("action_response_timeout", 10.0);
     planning_timeout_ = declare_parameter("planning_timeout", 10.0);
+    candidate_search_timeout_ = declare_parameter("candidate_search_timeout", 12.0);
     recovery_scan_timeout_ = declare_parameter("recovery_scan_timeout", 0.5);
     const auto no_progress = declare_parameter("no_progress_timeout", 30.0);
     const auto movement = declare_parameter("required_movement", 0.10);
     if (radius <= 0 || padding < 0 || goal_clearance_margin_ < 0 ||
       padded_radius_ <= 0 || map_timeout_ <= 0 || tf_timeout_ <= 0 ||
       action_timeout_ <= 0 || planning_timeout_ <= 0 || recovery_scan_timeout_ <= 0 ||
+      !std::isfinite(candidate_search_timeout_) || candidate_search_timeout_ <= 0 ||
       no_progress <= 0 || movement <= 0)
     {
       throw std::invalid_argument("exploration radii and timeouts must be positive");
@@ -233,6 +235,20 @@ private:
   {
     if (operation_.phase() != Phase::Idle) {return;}
     if (!mapFresh()) {return;}
+    const double time = now().seconds();
+    if (candidate_search_started_ < 0) {candidate_search_started_ = time;}
+    if (time - candidate_search_started_ >= candidate_search_timeout_) {
+      noCandidate(); return;
+    }
+    // Reserve the final third of the shared budget for blind-corner approaches.
+    // A long ordinary tier must not consume all opportunities for a short goal.
+    if (!short_candidates_.empty() &&
+      time - candidate_search_started_ >= candidate_search_timeout_ * 2.0 / 3.0)
+    {
+      candidates_ = std::move(short_candidates_);
+      short_candidates_.clear();
+      candidate_index_ = 0;
+    }
     if (candidate_index_ >= candidates_.size()) {
       // Keep the short tier for the entire batch, independent of per-point cooldowns.
       if (!short_candidates_.empty()) {
@@ -292,7 +308,8 @@ private:
         const auto & b = path.poses[i].pose.position;
         if (!maze_explorer::segmentFootprintFree(*map_, a.x, a.y, b.x, b.y, padded_radius_)) {
           RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-            "规划路径的完整车体净空不足，检查同簇其他站位");
+            "规划路径的完整车体净空不足：目标(%.2f,%.2f)，段(%.2f,%.2f)->(%.2f,%.2f)；检查其他站位",
+            candidate_.x, candidate_.y, a.x, a.y, b.x, b.y);
           planFailed(); return;
         }
         length += std::hypot(b.x - a.x, b.y - a.y);
@@ -305,6 +322,7 @@ private:
   void planFailed()
   {
     // A failed representative must not blacklist its entire frontier cluster.
+    attempted_goals_.record(candidate_.x, candidate_.y);
     remembered_.remember(candidate_.x, candidate_.y, now().seconds() + 10.0,
       0.025, false, progress_epoch_);
     retry_candidates_ = true;
@@ -314,6 +332,8 @@ private:
   {
     Pose robot;
     if (!mapFresh() || !pose("odom", robot)) {return;}
+    candidate_search_started_ = -1.0;
+    attempted_goals_.clear();
     nav_start_ = robot;
     nav_start_area_ = freeArea();
     watchdog_.start(now().seconds(), robot.x, robot.y, length);
@@ -489,6 +509,7 @@ private:
   void recoveryFinished()
   {
     retry_candidates_ = false;
+    candidate_search_started_ = -1.0;
     no_candidate_since_ = now().seconds();
     RCLCPP_INFO(get_logger(), "恢复结束，等待新地图并重新选择前沿");
   }
@@ -507,8 +528,10 @@ private:
       return;
     }
     if (no_candidate_since_ < 0) {no_candidate_since_ = time;}
+    if (candidate_search_started_ < 0) {candidate_search_started_ = time;}
+    const bool search_expired = time - candidate_search_started_ >= candidate_search_timeout_;
     Pose robot;
-    if (mapFresh() && pose("map", robot) && time - no_candidate_since_ < 60.0) {
+    if (!search_expired && mapFresh() && pose("map", robot)) {
       const auto geometric = maze_explorer::findCandidates(*map_, robot.x, robot.y,
         padded_radius_, {}, goal_clearance_margin_);
       double retry_at = std::numeric_limits<double>::infinity();
@@ -520,14 +543,21 @@ private:
         };
       consider(geometric.candidates);
       consider(geometric.short_candidates);
-      if (std::isfinite(retry_at) && retry_at - no_candidate_since_ <= 60.0) {
+      if (std::isfinite(retry_at) &&
+        retry_at <= candidate_search_started_ + candidate_search_timeout_)
+      {
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
           "安全候选仍在冷却，约 %.1f 秒后可重试；暂不判定停滞", retry_at - time);
         return;
       }
     }
     // Allow map updates and the exact-point planning cooldown to expire before moving.
-    if (time - no_candidate_since_ < (recovery_used_ ? 12.0 : 10.0)) {return;}
+    if (!search_expired &&
+      time - no_candidate_since_ < (recovery_used_ ? 12.0 : 10.0)) {return;}
+    if (search_expired) {
+      RCLCPP_WARN(get_logger(), "连续选点 %.1f 秒仍无安全路径，结束本轮重试并检查有界恢复",
+        time - candidate_search_started_);
+    }
     if (!recovery_used_) {startRecovery();}
     else {waitForImprovement("仍有未知前沿，但安全站位/路径不可达；有界恢复后等待地图或位姿改善");}
   }
@@ -569,6 +599,12 @@ private:
     candidates_ = result.candidates;
     short_candidates_ = !candidates_.empty() && !candidates_.front().short_goal ?
       result.short_candidates : std::vector<Candidate>{};
+    const auto least_recently_tried = [this](const Candidate & a, const Candidate & b) {
+        return attempted_goals_.lastAttempt(a.x, a.y) < attempted_goals_.lastAttempt(b.x, b.y);
+      };
+    // Stable ordering preserves path-distance preference among untried goals.
+    std::stable_sort(candidates_.begin(), candidates_.end(), least_recently_tried);
+    std::stable_sort(short_candidates_.begin(), short_candidates_.end(), least_recently_tried);
     candidate_index_ = 0;
     if (candidates_.empty()) {noCandidate(); return;}
     if (operation_.resume()) {
@@ -591,6 +627,9 @@ private:
       return;
     }
     last_tick_ = time;
+    // Keep lifecycle results fresh during navigation as well as while idle.
+    // Otherwise each successful goal is followed by a stale-cache discovery pause.
+    navigationActive();
     updateObservationProgress();
     const auto phase = operation_.phase();
     if (phase == Phase::Canceling) {
@@ -601,15 +640,21 @@ private:
       return;
     }
     if (phase == Phase::Idle || phase == Phase::Waiting) {
-      if (time - last_decision_ >= 2.0) {last_decision_ = time; decide();}
+      if (retry_candidates_ || time - last_decision_ >= 2.0) {
+        last_decision_ = time;
+        decide();
+      }
       return;
     }
     if (!mapFresh()) {requestCancel("地图过期"); return;}
     if ((phase == Phase::BackingUp || phase == Phase::Spinning) &&
       (!recoverySensorsReady() || !navigationActive()))
     {requestCancel("恢复期间激光/TF 过期或 Nav2 非 active"); return;}
-    if (phase == Phase::Planning && time - op_started_ >= planning_timeout_) {
-      requestCancel("规划超时"); return;
+    if (phase == Phase::Planning) {
+      if (time - op_started_ >= planning_timeout_) {requestCancel("规划超时"); return;}
+      if (candidate_search_started_ >= 0 &&
+        time - candidate_search_started_ >= candidate_search_timeout_)
+      {requestCancel("连续候选规划达到总重试时限"); return;}
     }
     if (phase == Phase::Sending && time - op_started_ >= action_timeout_) {
       requestCancel("导航目标确认超时"); return;
@@ -671,6 +716,7 @@ private:
   {
     if (!operation_.wait()) {return;}
     retry_candidates_ = false;
+    candidate_search_started_ = -1.0;
     writeStatus("stalled", false, reason, true);
     RCLCPP_WARN(get_logger(), "探索暂停（未完成，可恢复）：%s；保持监测新地图，不重复强行恢复",
       reason.c_str());
@@ -691,6 +737,7 @@ private:
   std::string save_path_;
   double padded_radius_, goal_clearance_margin_, map_timeout_, tf_timeout_;
   double action_timeout_, planning_timeout_, recovery_scan_timeout_;
+  double candidate_search_timeout_, candidate_search_started_{-1.0};
   double scan_received_{-100.0};
   double map_received_{-100.0}, op_started_{0.0}, cancel_started_{0.0};
   double last_tick_{-1.0}, last_decision_{-100.0}, no_candidate_since_{-1.0};
@@ -706,6 +753,7 @@ private:
   std::vector<Candidate> short_candidates_;
   std::size_t candidate_index_{0};
   maze_explorer::GoalExclusions remembered_;
+  maze_explorer::GoalAttemptHistory attempted_goals_;
   std::vector<LifecycleCheck> lifecycle_;
   maze_explorer::OperationTracker operation_;
   maze_explorer::ProgressWatchdog watchdog_;

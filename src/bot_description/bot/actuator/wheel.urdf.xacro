@@ -27,8 +27,7 @@
             <parent link="base_link"/>
             <child link="${wheel_name}_wheel_link"/>
             <origin xyz="${xyz}"/>
-            <axis xyz="0 1 0"/>
-            
+            <axis xyz="0 1 0"/>         
     </joint>
     <gazebo reference="${wheel_name}_wheel_link">
             <!-- 橡胶轮/地面摩擦约 1.0 即可；20.0 会让 ODE 接触求解器过刚，

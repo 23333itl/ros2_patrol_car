@@ -54,6 +54,11 @@ class FakeNav2(Node):
         self.epoch = time.monotonic()
         self.plan_succeeds = plan_succeeds
         self.plan_only_first = False
+        self.unsafe_plan = False
+        self.navigation_succeeds = False
+        self.large_room = False
+        self.far_plans_only = False
+        self.planned_positions = []
         self.publish_maps = True
         self.publish_scans = True
         self.scan_span = 2.0 * math.pi
@@ -175,6 +180,16 @@ class FakeNav2(Node):
         if not self.robot_cell_free:
             data[10 * 20 + 10] = -1  # Robot at world (0, 0) is outside known free space.
         grid.data = data
+        if self.large_room:
+            grid.info.resolution = 0.05
+            grid.info.width = grid.info.height = 30
+            grid.info.origin.position.x = -0.375
+            grid.info.origin.position.y = -0.775
+            data = [-1] * 900
+            for y in range(3, 27):
+                for x in range(3, 27):
+                    data[y * 30 + x] = 0
+            grid.data = data
         self.map_pub.publish(grid)
 
     def begin(self, kind, request=None):
@@ -195,13 +210,23 @@ class FakeNav2(Node):
 
     def plan(self, handle):
         self.begin('plan')
+        goal = handle.request.goal.pose.position
+        self.planned_positions.append((goal.x, goal.y))
         result = ComputePathToPose.Result()
-        if self.plan_succeeds and (not self.plan_only_first or self.counts['plan'] == 1):
+        if (self.plan_succeeds and (not self.plan_only_first or self.counts['plan'] == 1)
+                and (not self.far_plans_only or goal.x > 0.6)):
             result.path.header = handle.request.goal.header
             start = PoseStamped()
             start.header = handle.request.goal.header
             start.pose.orientation.w = 1.0
             result.path.poses = [start, handle.request.goal]
+            if self.unsafe_plan:
+                # The goal is safe, but this route crosses the room's occupied wall.
+                detour = PoseStamped()
+                detour.header = start.header
+                detour.pose.position.y = 0.8
+                detour.pose.orientation.w = 1.0
+                result.path.poses.insert(1, detour)
             handle.succeed()
         else:
             result.error_code = ComputePathToPose.Result.NO_VALID_PATH
@@ -215,6 +240,10 @@ class FakeNav2(Node):
         while not self.stopping.wait(0.02):
             if handle.is_cancel_requested and self.release_navigation.is_set():
                 handle.canceled()
+                self.end('navigation')
+                return result
+            if self.navigation_succeeds and not handle.is_cancel_requested:
+                handle.succeed()
                 self.end('navigation')
                 return result
         handle.abort()
@@ -243,7 +272,7 @@ class FakeNav2(Node):
 
 class ExplorerHarness:
     def __init__(self, case_number, plan_succeeds=True, frontiers=True, stream_maps=True,
-                 stream_scans=True, robot_cell_free=True):
+                 stream_scans=True, robot_cell_free=True, no_progress_timeout=2.0):
         self.directory = tempfile.TemporaryDirectory(prefix='maze-explorer-actions-')
         self.root = Path(self.directory.name)
         self.output = self.root / 'map'
@@ -265,7 +294,8 @@ class ExplorerHarness:
                    ROS_LOG_DIR=str(self.root / 'ros_logs'), ROS_LOCALHOST_ONLY='1')
         self.process = subprocess.Popen([
             str(OPTIONS.explorer_binary), '--ros-args',
-            '-p', 'use_sim_time:=true', '-p', 'no_progress_timeout:=2.0',
+            '-p', 'use_sim_time:=true',
+            '-p', 'no_progress_timeout:=' + str(no_progress_timeout),
             '-p', 'required_movement:=0.1', '-p', 'action_response_timeout:=10.0',
             '-p', 'map_save_path:=' + str(self.output),
         ], stdout=self.log_file, stderr=subprocess.STDOUT, env=env,
@@ -320,6 +350,52 @@ class ExplorerHarness:
 
 
 class ExplorerActionTests(unittest.TestCase):
+    def test_bounded_rounds_try_short_goals_and_do_not_starve_far_safe_goals(self):
+        with ExplorerHarness(7, no_progress_timeout=100.0) as h:
+            h.fake.large_room = True
+            h.fake.far_plans_only = True
+            h.wait_for(lambda: h.fake.counts['navigation'] == 1, 23.0,
+                       'an untried far safe goal after nearby routes repeatedly fail')
+            self.assertTrue(any(math.hypot(x, y) < 0.35
+                                for x, y in h.fake.planned_positions),
+                            'ordinary candidates consumed the short-goal opportunity')
+            self.assertGreater(h.fake.planned_positions[-1][0], 0.6)
+            self.assertLessEqual(h.fake.counts['backup'], 1)
+            self.assertEqual(h.fake.max_active_motion, 1)
+
+    def test_unsafe_paths_and_cooldowns_cannot_extend_selection_indefinitely(self):
+        with ExplorerHarness(5) as h:
+            h.fake.unsafe_plan = True
+            h.wait_for(lambda: h.fake.counts['plan'] > 0, 8.0, 'first unsafe route')
+            h.wait_for(lambda: h.fake.counts['backup'] == 1, 10.0,
+                       'selection budget ends before repeatedly expiring cooldowns')
+            first_plan = next(t for e, t in h.fake.events if e == 'plan_started')
+            backup = next(t for e, t in h.fake.events if e == 'backup_started')
+            self.assertLessEqual((backup - first_plan) * OPTIONS.clock_rate, 16.0)
+            self.assertGreater(h.fake.counts['plan'], 1)
+            self.assertEqual(h.fake.counts['navigation'], 0,
+                             'an unsafe route must never be sent to navigation')
+            self.assertEqual(h.fake.max_active_motion, 1)
+            h.wait_for(lambda: 'resumable: true' in h.status(), 15.0,
+                       'failed recovery remains resumable rather than falsely complete')
+            self.assertEqual(h.fake.counts['backup'], 1)
+            h.fake.unsafe_plan = False
+            h.wait_for(lambda: h.fake.counts['navigation'] >= 1, 8.0,
+                       'safe path resumes navigation without granting more recoveries')
+            self.assertEqual(h.fake.counts['backup'], 1)
+
+    def test_lifecycle_refresh_during_navigation_avoids_goal_handoff_pause(self):
+        with ExplorerHarness(6, no_progress_timeout=100.0) as h:
+            h.wait_for(lambda: h.fake.counts['navigation'] == 1, 8.0, 'first navigation')
+            h.sim_wait(6.0)  # Old code lets the lifecycle cache expire after five seconds.
+            self.assertGreaterEqual(h.fake.lifecycle_requests, 15)
+            h.fake.navigation_succeeds = True
+            h.wait_for(lambda: h.fake.counts['navigation'] >= 2, 4.0,
+                       'next goal without a new lifecycle discovery wait')
+            terminal = next(t for e, t in h.fake.events if e == 'navigation_terminal')
+            next_goal = [t for e, t in h.fake.events if e == 'navigation_started'][1]
+            self.assertLess((next_goal - terminal) * OPTIONS.clock_rate, 1.5)
+
     def test_cancel_waits_for_terminal_and_recovery_is_single_flight(self):
         with ExplorerHarness(0) as h:
             h.fake.plan_only_first = True
@@ -471,8 +547,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--scenario', choices=['all', 'cancel', 'complete', 'stalled',
-                                               'interrupted', 'recovery_scan'],
-                        default='all', help='run one regression scenario or all five')
+                                               'interrupted', 'recovery_scan', 'selection', 'handoff',
+                                               'fairness'],
+                        default='all', help='run one regression scenario or all eight')
     parser.add_argument('--executable', '--explorer-binary', dest='explorer_binary', type=Path,
                         default=workspace / 'install/maze_explorer/lib/maze_explorer/explorer_node')
     parser.add_argument('--domain-id', type=int, default=40 + os.getpid() % 100,
@@ -495,6 +572,9 @@ def main():
         'stalled': 'test_unplannable_frontiers_stall_instead_of_completing',
         'interrupted': 'test_interrupted_empty_map_sequence_requires_five_new_clean_maps',
         'recovery_scan': 'test_recovery_waits_for_full_scan_and_resumes_after_global_map_overlap_clears',
+        'selection': 'test_unsafe_paths_and_cooldowns_cannot_extend_selection_indefinitely',
+        'handoff': 'test_lifecycle_refresh_during_navigation_avoids_goal_handoff_pause',
+        'fairness': 'test_bounded_rounds_try_short_goals_and_do_not_starve_far_safe_goals',
     }
     selected = names.values() if OPTIONS.scenario == 'all' else [names[OPTIONS.scenario]]
     suite = unittest.TestSuite(ExplorerActionTests(name) for name in selected)

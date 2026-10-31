@@ -48,6 +48,13 @@ heading_prior_turn:
 # 匹配响应最大为 1.0，因此 1.1 只关闭该类边，不关闭正常顺序边。
 # 局部/全局回环候选在 1510 s 回放中均未通过几何验收，不在这里启用。
 simulation_stable:
+  
+  minimum_travel_distance: 0.02
+  minimum_travel_heading: 0.02
+  minimum_time_interval: 0.1
+  transform_publish_period: 0.05
+  transform_timeout: 0.5
+
   use_scan_matching: true
   do_loop_closing: false
   use_scan_barycenter: false

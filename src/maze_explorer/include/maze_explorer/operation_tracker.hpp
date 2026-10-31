@@ -37,6 +37,43 @@ private:
   std::vector<Entry> entries_;
 };
 
+// Carry failed-candidate order across bounded search rounds. A timeout must not
+// keep restarting at the same nearby goals and starve an untried distant goal.
+class GoalAttemptHistory
+{
+public:
+  void record(double x, double y)
+  {
+    for (auto & entry : entries_) {
+      if (std::hypot(x - entry.x, y - entry.y) < 0.025) {
+        entry.sequence = ++sequence_;
+        return;
+      }
+    }
+    if (entries_.size() >= 512) {
+      entries_.erase(std::min_element(entries_.begin(), entries_.end(),
+        [](const Entry & a, const Entry & b) {return a.sequence < b.sequence;}));
+    }
+    entries_.push_back({x, y, ++sequence_});
+  }
+  std::uint64_t lastAttempt(double x, double y) const
+  {
+    std::uint64_t last = 0;
+    for (const auto & entry : entries_) {
+      if (std::hypot(x - entry.x, y - entry.y) < 0.025) {
+        last = std::max(last, entry.sequence);
+      }
+    }
+    return last;
+  }
+  void clear() {entries_.clear(); sequence_ = 0;}
+
+private:
+  struct Entry {double x, y; std::uint64_t sequence;};
+  std::vector<Entry> entries_;
+  std::uint64_t sequence_{0};
+};
+
 // A canceled operation still owns the motion channel until its terminal result arrives.
 class OperationTracker
 {
