@@ -52,6 +52,10 @@ if(BUILD_TESTING)
     COMMAND /usr/bin/python3 ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mapping_replay.py
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
     TIMEOUT 30)
+  ament_add_test(test_slam_profiles
+    COMMAND /usr/bin/python3 ${CMAKE_CURRENT_SOURCE_DIR}/test/test_slam_profiles.py
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 30)
 endif()
 
 ament_package()

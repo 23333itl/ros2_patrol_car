@@ -1,5 +1,5 @@
 # 仅覆盖明确列出的参数；baseline 保留 slam_params 文件的原始值。
-# 启动默认使用用户实测准确的 simulation_stable；baseline 保留用于对照。
+# 工程仿真默认使用用户实测平稳的 odometry_only；simulation_stable 保留为可选扫描匹配配置。
 baseline: {}
 baseline_turn:
   check_min_dist_and_heading_precisely: true
@@ -25,7 +25,8 @@ heading_prior:
   fine_search_angle_offset: 0.000872665
   use_response_expansion: false
 odometry_only:
-  # 仅作诊断对照，不用于正式导航默认值。
+  # 用户选择的工程仿真默认：保留原命令参数，激光仍参与绘图，定位依赖现有里程计链路。
+  # 不用扫描匹配纠正里程计，因此避免该修正引起的 RViz 跳动，但不能用激光消除里程计漂移。
   use_scan_matching: false
   do_loop_closing: false
 heading_prior_turn:
@@ -47,8 +48,7 @@ heading_prior_turn:
 # 邻近扫描链约束。对称走廊中这些约束会放大缓慢的平移误差；Karto 的
 # 匹配响应最大为 1.0，因此 1.1 只关闭该类边，不关闭正常顺序边。
 # 局部/全局回环候选在 1510 s 回放中均未通过几何验收，不在这里启用。
-simulation_stable:
-  
+simulation_stable: &simulation_stable_params
   minimum_travel_distance: 0.02
   minimum_travel_heading: 0.02
   minimum_time_interval: 0.1
@@ -75,3 +75,20 @@ simulation_stable:
   correlation_search_space_smear_deviation: 0.1
   resolution: 0.025
 
+# 与默认使用同一基线，避免分辨率/扫描触发阈值干扰比较。
+# 关闭匹配仅供诊断，不参与默认配置的候选晋级。
+stable_no_match_control:
+  <<: *simulation_stable_params
+  use_scan_matching: false
+
+# Karto 内部对 variance 参数平方；降低数值会加强里程计先验。
+# 2026-10-31：这两个数值在两档噪声的完整回放中均出现大幅定位修正，
+# 未通过验收。保留用于复现/诊断，不应用于正式巡逻或替换默认。
+stable_translation_prior:
+  <<: *simulation_stable_params
+  distance_variance_penalty: 0.03
+
+stable_pose_prior:
+  <<: *simulation_stable_params
+  distance_variance_penalty: 0.03
+  angle_variance_penalty: 0.003

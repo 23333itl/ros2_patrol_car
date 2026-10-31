@@ -200,6 +200,39 @@ TEST(FrontierSearch, CountsSmallFrontiersEvenWhenNoClusterCanBeSelected)
 
   EXPECT_TRUE(result.robot_in_known_free);
   EXPECT_EQ(result.frontier_cells, 1U);
+  EXPECT_EQ(result.small_frontier_cells, 1U);
+  EXPECT_EQ(result.frontier_clusters, 1U);
+  EXPECT_EQ(result.significant_frontier_clusters, 0U);
+  EXPECT_TRUE(result.candidates.empty());
+}
+
+TEST(FrontierSearch, ExcludingEveryGoalDoesNotEraseSignificantFrontiers)
+{
+  const auto map = roomMap();
+  const auto robot = cellCenter(map, 15, 15);
+  const auto result = findCandidates(map, robot.first, robot.second, 0.13,
+    [](double, double) {return true;});
+  ASSERT_TRUE(result.robot_footprint_free);
+  EXPECT_TRUE(result.candidates.empty());
+  EXPECT_TRUE(result.short_candidates.empty());
+  EXPECT_GT(result.significant_frontier_clusters, 0U);
+  EXPECT_GT(result.excluded_standpoints, 0U);
+}
+
+TEST(FrontierSearch, SeparatedSmallClustersDoNotAddUpToASignificantFrontier)
+{
+  auto map = makeMap(30, 30, 0.05F, 100);
+  fillRectangle(map, 3, 3, 26, 26, 0);
+  fillRectangle(map, 27, 8, 27, 8, -1);
+  fillRectangle(map, 27, 16, 27, 16, -1);
+  const auto robot = cellCenter(map, 15, 15);
+  const auto result = findCandidates(map, robot.first, robot.second, 0.13, {});
+  ASSERT_TRUE(result.robot_footprint_free);
+  EXPECT_EQ(result.frontier_cells, 6U);
+  EXPECT_EQ(result.frontier_clusters, 2U);
+  EXPECT_EQ(result.small_clusters, 2U);
+  EXPECT_EQ(result.small_frontier_cells, 6U);
+  EXPECT_EQ(result.significant_frontier_clusters, 0U);
   EXPECT_TRUE(result.candidates.empty());
 }
 

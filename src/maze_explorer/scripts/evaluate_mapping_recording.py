@@ -95,6 +95,8 @@ def evaluate(recording, world, output, launch_log=None, status_path=None, min_du
         report.update(acceptance='incomplete', reason=f'Need >={min_duration} seconds, paired scans/poses, and odometry brackets')
     if launch_log:
         log = launch_log.read_text(errors='replace')
+        from mapping_events import data_health
+        report['data_health'] = data_health(scans, log)
         success = log.count('导航终止：成功')
         failures = log.count('导航终止：失败/取消')
         state = yaml.safe_load(status_path.read_text()) if status_path and status_path.exists() else None
@@ -109,6 +111,9 @@ def evaluate(recording, world, output, launch_log=None, status_path=None, min_du
                                 'final_exploration_state': state, 'last_60s_distance_m': movement,
                                 'last_60s_displacement_span_m': span}
         report['navigation_acceptance'] = 'pass' if nav_pass else 'fail'
+        if not report['data_health']['complete']:
+            report.update(acceptance='incomplete', navigation_acceptance='incomplete',
+                          reason='Input scan gaps, message-filter drops, or sustained control underruns')
     (output/'summary.json').write_text(json.dumps(report, indent=2))
     print(json.dumps({k: v for k, v in report.items() if k not in ('map_walls', 'scan_walls')}, indent=2))
     return report

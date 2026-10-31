@@ -35,8 +35,12 @@ struct SearchResult
   bool robot_in_known_free = false;
   bool robot_footprint_free = false;
   std::size_t reachable_cells = 0, frontier_clusters = 0, small_clusters = 0;
+  // Count geometry before reachability, distance, cooldown and blacklist filters.
+  std::size_t significant_frontier_clusters = 0, small_frontier_cells = 0;
   std::size_t excluded_standpoints = 0, too_close_standpoints = 0, unreachable_frontiers = 0;
 };
+
+inline constexpr std::size_t kMinimumFrontierClusterCells = 5;
 
 inline bool validMap(const nav_msgs::msg::OccupancyGrid & map)
 {
@@ -391,10 +395,12 @@ inline SearchResult findCandidates(
       }
     }
     ++result.frontier_clusters;
-    if (cluster.size() < 5) {
+    if (cluster.size() < kMinimumFrontierClusterCells) {
       ++result.small_clusters;
+      result.small_frontier_cells += cluster.size();
       continue;
     }
+    ++result.significant_frontier_clusters;
     for (const auto frontier_cell : cluster) {
       const auto standpoint = owner[frontier_cell];
       if (standpoint == no_cell) {++result.unreachable_frontiers; continue;}

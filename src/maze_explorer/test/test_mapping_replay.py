@@ -3,6 +3,8 @@
 import csv
 import json
 import math
+import signal
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -19,9 +21,10 @@ from tf2_msgs.msg import TFMessage
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'scripts'))
 from mapping_analysis import (compare_trajectory, compose, inverse, transform_points,
                               wall_measurements, wall_direction_timeline)
-from replay_mapping import bag_reader, prepare
+from replay_mapping import bag_reader, prepare, publish_tf_until, stop_owned_process
 from record_mapping_diagnostics import Diagnostics
-from mapping_events import correction_steps, write_correction_diagnostics
+from mapping_events import (correction_steps, write_correction_diagnostics,
+                            correction_statistics, correction_gate, data_health)
 
 
 def edge(parent, child):
@@ -33,6 +36,119 @@ def edge(parent, child):
 
 
 class MappingReplayTest(unittest.TestCase):
+    def test_replay_cleanup_reaps_owned_slam_even_if_it_ignores_soft_signals(self):
+        from unittest.mock import Mock, patch, call
+        process = Mock(pid=1234)
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired('slam', 8),
+                                   subprocess.TimeoutExpired('slam', 5), 0]
+        with patch('replay_mapping.os.killpg') as kill:
+            stop_owned_process(process)
+        self.assertEqual(kill.call_args_list, [call(1234, signal.SIGINT),
+                         call(1234, signal.SIGTERM), call(1234, signal.SIGKILL)])
+        self.assertEqual(process.wait.call_count, 3)
+        process.poll.return_value = 0
+        with patch('replay_mapping.os.killpg') as kill:
+            stop_owned_process(process)
+        kill.assert_not_called()
+
+    def test_tf_preroll_keeps_original_messages_and_does_not_repeat_or_extrapolate(self):
+        first, second = TFMessage(transforms=[edge('odom', 'base_footprint')]), TFMessage(transforms=[edge('odom', 'base_footprint')])
+        samples, sent = [(1., first), (1.1, second)], []
+        index = publish_tf_until(samples, 0, 1.05, sent.append)
+        self.assertEqual(index, 1)
+        self.assertIs(sent[0], first)
+        self.assertEqual(publish_tf_until(samples, index, 1.05, sent.append), 1)
+        index = publish_tf_until(samples, index, 1.2, sent.append)
+        self.assertEqual(index, 2)
+        self.assertIs(sent[1], second)
+        self.assertEqual(first.transforms[0].header.stamp.sec, 0)
+        self.assertEqual(len(sent), 2)
+
+    def test_recording_stop_uses_same_clock_as_reported_duration(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        recorder = Diagnostics.__new__(Diagnostics)
+        recorder.args = SimpleNamespace(duration=600., wall_timeout=0.)
+        recorder.start_sim, recorder.last_clock = 0., 0.
+        recorder.stopping = SimpleNamespace(is_set=lambda: False)
+        ticks = iter((599.999, 600.001))
+        def spin(*_args, **_kwargs):
+            recorder.last_clock = next(ticks)
+        recorder.rclpy = SimpleNamespace(ok=lambda: True, spin_once=Mock(side_effect=spin))
+        recorder.node = object()
+        recorder.now = lambda: 601.  # The node TimeSource is ahead of our callback.
+        recorder.sample_publishers = recorder.sample_slam = recorder.sample_scan_map = lambda: None
+        recorder.processes = []
+        recorder.run()
+        self.assertEqual(recorder.rclpy.spin_once.call_count, 2)
+        self.assertGreaterEqual(recorder.last_clock-recorder.start_sim, 600.)
+
+    def test_data_health_distinguishes_input_gaps_from_skipped_processing(self):
+        self.assertTrue(data_health([0., .1, .2])['complete'])
+        self.assertFalse(data_health([0., .2])['complete'])
+        warning = '[controller_server-1] [WARN] [{}] [controller]: Control loop missed its desired rate'
+        self.assertTrue(data_health([0., .1], warning.format('100.1'))['complete'])
+        log = '\n'.join(warning.format(str(t)) for t in (100.1, 101.2, 102.3))
+        self.assertFalse(data_health([0., .1], log)['complete'])
+        self.assertFalse(data_health([0., .1], 'Message Filter dropping message')['complete'])
+
+    def test_motion_statistics_include_scan_free_time_and_separate_revisit(self):
+        odom = []
+        for index in range(501):
+            t = index/10
+            x = 0. if t <= 5 else (min(2., (t-5)*.2) if t <= 25 else max(0., 2.-(t-25)*.1))
+            yaw = max(0., min(1., (t-15)*.1))
+            odom.append((t, x, 0., yaw))
+        steps = [dict(stamp_s=t, position_step_m=.01, yaw_step_deg=.1)
+                 for t in (2., 10., 20., 35., 46.)]
+        stats = correction_statistics(steps, odom)
+        self.assertEqual([r['motion'] for r in steps],
+                         ['stationary', 'straight', 'turn', 'straight', 'stationary'])
+        self.assertTrue(steps[-1]['revisit'])
+        self.assertAlmostEqual(stats['all']['duration_sim_s'], 50.)
+        self.assertAlmostEqual(stats['all']['position_m_per_sim_s'], .05/50.)
+        self.assertAlmostEqual(stats['turn']['position_p95_m'], .01)
+        self.assertGreater(stats['revisit']['duration_sim_s'], 0.)
+        fewer = correction_statistics(steps[:1], odom)
+        self.assertEqual(stats['all']['duration_sim_s'], fewer['all']['duration_sim_s'])
+        self.assertIsNone(fewer['turn']['position_p95_m'])
+
+    @staticmethod
+    def gate_report(profile, position=.01, yaw=.1, cumulative=.01):
+        return {'profile': profile, 'input_sha256': 'same-input', 'acceptance': 'pass',
+                'playback': {'playback_duration_s': 601.},
+                'correction_diagnostics': {'correction_jumps': [], 'missing_odom_brackets': 0,
+                    'by_motion': {'moving': {'position_p95_m': position, 'yaw_p95_deg': yaw},
+                        'all': {'position_m_per_sim_s': cumulative, 'yaw_deg_per_sim_s': cumulative},
+                        'turn': {'duration_sim_s': 10.}, 'revisit': {'duration_sim_s': 10.}}}}
+
+    def test_prior_gate_requires_relative_gain_and_bounded_cumulative_correction(self):
+        base = self.gate_report('simulation_stable')
+        candidate = self.gate_report('stable_pose_prior', position=.007, yaw=.105, cumulative=.0105)
+        self.assertEqual(correction_gate(base, candidate)['acceptance'], 'pass')
+        for changes in ({'position': .0071}, {'yaw': .106}, {'cumulative': .0106}):
+            with self.subTest(changes=changes):
+                values = dict(position=.007, yaw=.1, cumulative=.01)
+                values.update(changes)
+                self.assertEqual(correction_gate(base, self.gate_report('stable_pose_prior', **values))['acceptance'], 'fail')
+
+    def test_prior_gate_rejects_diagnostic_winners_missing_data_or_different_inputs(self):
+        base = self.gate_report('simulation_stable')
+        for alteration in ('diagnostic', 'hash', 'short', 'missing', 'jump', 'no_revisit'):
+            candidate = self.gate_report('stable_translation_prior', position=.006)
+            if alteration == 'diagnostic': candidate['profile'] = 'stable_no_match_control'
+            if alteration == 'hash': candidate['input_sha256'] = 'different'
+            if alteration == 'short': candidate['playback']['playback_duration_s'] = 599.
+            if alteration == 'missing': candidate['acceptance'] = 'incomplete'
+            if alteration == 'jump': candidate['correction_diagnostics']['correction_jumps'] = [{'stamp_s': 40}]
+            if alteration == 'no_revisit': candidate['correction_diagnostics']['by_motion']['revisit']['duration_sim_s'] = 0.
+            with self.subTest(alteration=alteration):
+                self.assertEqual(correction_gate(base, candidate)['acceptance'], 'fail')
+        base['acceptance'] = 'fail'  # A complete but distorted baseline must remain comparable.
+        base['correction_diagnostics']['correction_jumps'] = [{'stamp_s': 10.}]
+        self.assertEqual(correction_gate(base, self.gate_report('stable_pose_prior', position=.006))['acceptance'], 'pass')
+
     def test_incremental_wall_fit_matches_full_fit_and_locates_crossing(self):
         segments = np.array([[[0., 0.], [2., 0.]], [[0., 1.], [2., 1.]]])
         x = np.linspace(.2, 1.8, 80)
@@ -108,6 +224,20 @@ class MappingReplayTest(unittest.TestCase):
             event = next((output/'jump_events').iterdir())
             self.assertEqual(json.loads((event/'event.json').read_text())['window_sim_s'], [-4., 6.])
             self.assertTrue((event/'poses.png').stat().st_size > 1000)
+
+    def test_jump_exports_actual_scan_ranges_and_marks_recorded_tf_provenance(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            self.write_bag(root/'recording/rosbag')
+            poses = [(0., 0., 0., 0.), (1., .2, 0., 0.)]
+            write_correction_diagnostics(poses, [(0., 0., 0., 0.), (1., 0., 0., 0.)],
+                                         root/'report', context_directory=root/'recording')
+            event = next((root/'report/jump_events').iterdir())
+            scans = [json.loads(line) for line in (event/'scan.jsonl').read_text().splitlines()]
+            self.assertEqual(len(scans), 1)
+            self.assertIn('ranges', scans[0])
+            self.assertTrue(json.loads((event/'tf_static.json').read_text()))
+            self.assertIn('original recording', json.loads((event/'event.json').read_text())['context_tf_note'])
 
     def test_scan_stamped_slam_pose_has_no_child_frame_field(self):
         from geometry_msgs.msg import PoseWithCovarianceStamped

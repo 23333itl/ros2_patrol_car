@@ -5,6 +5,32 @@ using maze_explorer::OperationTracker;
 using maze_explorer::Phase;
 using maze_explorer::ProgressWatchdog;
 
+TEST(CompletionEvidence, TimerTicksCannotReplaceFiveDistinctMaps)
+{
+  maze_explorer::CompletionEvidence evidence;
+  for (int time = 0; time < 20; ++time) {
+    EXPECT_FALSE(evidence.observe(time, 1, false));
+  }
+  EXPECT_FALSE(evidence.observe(20.0, 2, false));
+  EXPECT_FALSE(evidence.observe(21.0, 3, false));
+  EXPECT_FALSE(evidence.observe(22.0, 4, false));
+  EXPECT_TRUE(evidence.observe(23.0, 5, false));
+}
+
+TEST(CompletionEvidence, SmallClustersNeedQuietTimeAndInterruptionRestartsEvidence)
+{
+  maze_explorer::CompletionEvidence evidence(10.0);
+  for (int i = 0; i < 5; ++i) {EXPECT_FALSE(evidence.observe(i, i + 1, true));}
+  EXPECT_FALSE(evidence.observe(9.0, 6, false));
+  EXPECT_TRUE(evidence.hasResidual());
+  // A significant frontier, stale TF or an untrustworthy map clears the window.
+  evidence.reset();
+  EXPECT_FALSE(evidence.active());
+  for (int i = 0; i < 5; ++i) {EXPECT_FALSE(evidence.observe(10.0 + i, i + 7, true));}
+  EXPECT_FALSE(evidence.observe(19.0, 12, true));
+  EXPECT_TRUE(evidence.observe(20.0, 13, true));
+}
+
 TEST(GoalExclusions, NavigationFailureIsStillCoolingAfterRecoveryWait)
 {
   maze_explorer::GoalExclusions exclusions;

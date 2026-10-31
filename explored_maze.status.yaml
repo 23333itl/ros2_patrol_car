@@ -1,6 +1,11 @@
-status: stalled
+status: exploring
 completed: false
-reason: "恢复等待新鲜完整 360° 激光、有效 TF 和 active 的 Nav2；保持静止"
-resumable: true
-map_saved: true
-simulation_time: 3594.93
+reason: "安全候选重新出现，恢复探索"
+resumable: false
+map_saved: false
+completion_criterion: significant_frontiers
+minimum_frontier_cluster_cells: 5
+raw_frontier_cells: 65
+significant_frontier_clusters: 3
+ignored_small_frontier_cells: 11
+simulation_time: 8844.52

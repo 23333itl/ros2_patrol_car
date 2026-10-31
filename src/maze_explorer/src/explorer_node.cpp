@@ -54,6 +54,7 @@ public:
     action_timeout_ = declare_parameter("action_response_timeout", 10.0);
     planning_timeout_ = declare_parameter("planning_timeout", 10.0);
     candidate_search_timeout_ = declare_parameter("candidate_search_timeout", 12.0);
+    const auto completion_quiet_time = declare_parameter("completion_confirmation_time", 10.0);
     recovery_scan_timeout_ = declare_parameter("recovery_scan_timeout", 0.5);
     const auto no_progress = declare_parameter("no_progress_timeout", 30.0);
     const auto movement = declare_parameter("required_movement", 0.10);
@@ -61,32 +62,37 @@ public:
       padded_radius_ <= 0 || map_timeout_ <= 0 || tf_timeout_ <= 0 ||
       action_timeout_ <= 0 || planning_timeout_ <= 0 || recovery_scan_timeout_ <= 0 ||
       !std::isfinite(candidate_search_timeout_) || candidate_search_timeout_ <= 0 ||
+      !std::isfinite(completion_quiet_time) || completion_quiet_time <= 0 ||
       no_progress <= 0 || movement <= 0)
     {
       throw std::invalid_argument("exploration radii and timeouts must be positive");
     }
     watchdog_ = maze_explorer::ProgressWatchdog(no_progress, movement);
+    completion_ = maze_explorer::CompletionEvidence(completion_quiet_time);
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
     map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       "/map", rclcpp::QoS(1).transient_local().reliable(),
       [this](nav_msgs::msg::OccupancyGrid::SharedPtr map) {
         if (!maze_explorer::validMap(*map)) {
-          empty_maps_ = 0;
+          completion_.reset();
           RCLCPP_WARN(get_logger(), "忽略无效地图");
           return;
         }
+        if (now().seconds() - map_received_ > map_timeout_) {completion_.reset();}
         map_ = map;
         map_received_ = now().seconds();
         ++map_revision_;
         // An intervening uncertain/frontier map breaks the completion streak even
         // if the slower decision timer never samples that particular revision.
-        if (empty_maps_ > 0) {
+        if (completion_.active()) {
           Pose robot;
-          if (!mapFresh() || !pose("map", robot)) {empty_maps_ = 0; return;}
+          if (!mapFresh() || !pose("map", robot)) {completion_.reset(); return;}
           const auto check = maze_explorer::findCandidates(*map_, robot.x, robot.y,
             padded_radius_, [](double, double) {return true;});
-          if (!check.robot_in_known_free || check.frontier_cells != 0) {empty_maps_ = 0;}
+          if (!check.robot_in_known_free || !check.robot_footprint_free ||
+            check.significant_frontier_clusters > 0)
+          {completion_.reset();}
         }
       });
     scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
@@ -565,37 +571,63 @@ private:
   void decide()
   {
     if (!mapFresh()) {
+      completion_.reset();
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "等待新鲜 /map；尚不发送探索目标");
-      return;
-    }
-    if (!navigationActive()) {
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "等待 Nav2 生命周期节点全部 active");
       return;
     }
     Pose robot;
     if (!pose("map", robot) || !pose("odom", robot_odom_)) {
+      completion_.reset();
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "等待新鲜 map/odom 到 base_footprint 的 TF");
       return;
     }
-    if (retry_candidates_) {tryNextCandidate(); return;}
+    if (retry_candidates_ && last_frontier_revision_ == map_revision_) {
+      if (navigationActive()) {tryNextCandidate();}
+      return;
+    }
     const auto result = maze_explorer::findCandidates(*map_, robot.x, robot.y,
       padded_radius_, [this](double x, double y) {return excluded(x, y);},
       goal_clearance_margin_);
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-      "前沿筛选：原始=%zu 簇=%zu 小簇=%zu 可达格=%zu 不可达前沿=%zu 冷却/锁定=%zu 过近=%zu 起点自由=%d 车体净空=%d",
+      "前沿筛选：原始=%zu 簇=%zu 小簇=%zu 有效簇=%zu 可达格=%zu 不可达前沿=%zu 冷却/锁定=%zu 过近=%zu 起点自由=%d 车体净空=%d",
       result.frontier_cells, result.frontier_clusters, result.small_clusters,
+      result.significant_frontier_clusters,
       result.reachable_cells, result.unreachable_frontiers, result.excluded_standpoints,
       result.too_close_standpoints, result.robot_in_known_free, result.robot_footprint_free);
-    if (!result.robot_in_known_free) {empty_maps_ = 0; noCandidate(); return;}
-    if (result.frontier_cells == 0) {
-      if (last_empty_revision_ != map_revision_) {
-        last_empty_revision_ = map_revision_;
-        ++empty_maps_;
-      }
-      if (empty_maps_ >= 5) {finish(true, "连续五张新鲜地图没有未知前沿");}
+    last_frontier_revision_ = map_revision_;
+    last_raw_frontier_cells_ = result.frontier_cells;
+    last_significant_clusters_ = result.significant_frontier_clusters;
+    last_small_frontier_cells_ = result.small_frontier_cells;
+    if (!result.robot_in_known_free || !result.robot_footprint_free) {
+      completion_.reset();
+      if (navigationActive()) {noCandidate();}
       return;
     }
-    empty_maps_ = 0;
+    if (result.significant_frontier_clusters == 0) {
+      // Stop stale candidate batches. Small clusters are already ignored by
+      // target selection and must not keep exploration/recovery alive forever.
+      retry_candidates_ = false;
+      candidates_.clear();
+      short_candidates_.clear();
+      candidate_search_started_ = no_candidate_since_ = -1.0;
+      if (completion_.observe(now().seconds(), map_revision_, result.frontier_cells > 0)) {
+        const std::string reason = completion_.hasResidual() ?
+          "有效前沿持续消失，已通过五张新鲜地图和稳定时间确认；剩余小簇按选点阈值忽略" :
+          "连续五张新鲜地图没有未知前沿";
+        finish(true, reason);
+      } else {
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+          "有效前沿簇为零，确认收尾中；原始前沿 %zu 格，小簇 %zu；不再发送导航或恢复",
+          result.frontier_cells, result.small_clusters);
+      }
+      return;
+    }
+    completion_.reset();
+    if (!navigationActive()) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "等待 Nav2 生命周期节点全部 active");
+      return;
+    }
+    if (retry_candidates_) {tryNextCandidate(); return;}
     candidates_ = result.candidates;
     short_candidates_ = !candidates_.empty() && !candidates_.front().short_goal ?
       result.short_candidates : std::vector<Candidate>{};
@@ -709,6 +741,11 @@ private:
       "\nreason: " << std::quoted(reason) << "\nresumable: " <<
       (operation_.phase() == Phase::Waiting ? "true" : "false") <<
       "\nmap_saved: " << (saved ? "true" : "false") <<
+      "\ncompletion_criterion: significant_frontiers" <<
+      "\nminimum_frontier_cluster_cells: " << maze_explorer::kMinimumFrontierClusterCells <<
+      "\nraw_frontier_cells: " << last_raw_frontier_cells_ <<
+      "\nsignificant_frontier_clusters: " << last_significant_clusters_ <<
+      "\nignored_small_frontier_cells: " << last_small_frontier_cells_ <<
       "\nsimulation_time: " << now().seconds() << '\n';
   }
 
@@ -745,8 +782,8 @@ private:
   std::string cancel_reason_;
   bool cancel_sent_{false}, retry_candidates_{false}, recovery_used_{false};
   Kind kind_{Kind::Plan};
-  int empty_maps_{0};
-  std::uint64_t map_revision_{0}, last_empty_revision_{0}, progress_map_revision_{0}, progress_epoch_{0};
+  std::uint64_t map_revision_{0}, last_frontier_revision_{0}, progress_map_revision_{0}, progress_epoch_{0};
+  std::size_t last_raw_frontier_cells_{0}, last_significant_clusters_{0}, last_small_frontier_cells_{0};
   Pose nav_start_, robot_odom_;
   Candidate candidate_{};
   std::vector<Candidate> candidates_;
@@ -757,6 +794,7 @@ private:
   std::vector<LifecycleCheck> lifecycle_;
   maze_explorer::OperationTracker operation_;
   maze_explorer::ProgressWatchdog watchdog_;
+  maze_explorer::CompletionEvidence completion_;
   maze_explorer::VisitedGoals visited_goals_;
   rclcpp::TimerBase::SharedPtr timer_;
   nav_msgs::msg::OccupancyGrid::SharedPtr map_;

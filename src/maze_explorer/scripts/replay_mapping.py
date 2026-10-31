@@ -22,7 +22,32 @@ import time
 import yaml
 
 PROFILE_NAMES = ('baseline', 'baseline_turn', 'near_chains', 'heading_prior',
-                 'heading_prior_turn', 'simulation_stable', 'odometry_only')
+                 'heading_prior_turn', 'simulation_stable', 'odometry_only',
+                 'stable_no_match_control', 'stable_translation_prior', 'stable_pose_prior')
+
+
+def publish_tf_until(samples, index, deadline, publish):
+    """Schedule original TF messages; never synthesize or restamp transforms."""
+    while index < len(samples) and samples[index][0] <= deadline:
+        publish(samples[index][1])
+        index += 1
+    return index
+
+
+def stop_owned_process(process):
+    """Bound cleanup of a process group created by this replay instance."""
+    for sig, timeout in ((signal.SIGINT, 8), (signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def bag_reader(path):
@@ -142,6 +167,7 @@ class Replay:
         self.publishers = {}
         self.types = {}
         self.odom = []
+        self.dynamic_tf = []
         self.static = []
         all_static = []
         manifest = args.input/'filter_report.json'
@@ -174,14 +200,17 @@ class Replay:
                         raise ValueError('Input contains forbidden dynamic TF edges; run prepare first')
                     for t in message.transforms:
                         self.odom.append((stamp_seconds(t.header.stamp), *transform_pose(t)))
+                    self.dynamic_tf.append((max(stamp_seconds(t.header.stamp) for t in message.transforms), message))
         from mapping_analysis import allowed_transforms, normalize_samples, robot_static_frames
         frames = robot_static_frames(all_static)
         for message in self.static:
             if len(allowed_transforms(message, static=True, frames=frames)) != len(message.transforms):
                 raise ValueError('Input contains unrelated static TF edges; run prepare first')
         self.odom = normalize_samples(self.odom)
+        self.dynamic_tf.sort(key=lambda item: item[0])
         self.pose_rows = []
         self.scans = {}
+        self.input_scan_stamps = []
         self.localized_scans = []
         self.map = None
         self.residuals = []
@@ -246,7 +275,7 @@ class Replay:
     def start(self):
         from lifecycle_msgs.srv import ChangeState
         from ament_index_python.packages import get_package_prefix
-        self.spin_for(.5)
+        self.spin_for(2.)
         others = [name for name, _ in self.node.get_node_names_and_namespaces() if name != 'mapping_replay']
         if others:
             raise RuntimeError(f'ROS domain is not isolated; existing nodes: {others}')
@@ -283,6 +312,7 @@ class Replay:
         request.names = ['use_scan_matching', 'do_loop_closing', 'use_scan_barycenter',
                          'link_scan_maximum_distance', 'link_match_minimum_response_fine',
                          'angle_variance_penalty', 'coarse_search_angle_offset', 'use_response_expansion',
+                         'distance_variance_penalty', 'minimum_distance_penalty',
                          'check_min_dist_and_heading_precisely', 'minimum_travel_distance',
                          'minimum_travel_heading', 'minimum_time_interval', 'transform_timeout',
                          'minimum_angle_penalty', 'coarse_angle_resolution', 'fine_search_angle_offset',
@@ -297,6 +327,7 @@ class Replay:
         next_notice = start_wall+20.
         for_message_count = Counter()
         last_clock_publish_stamp = None
+        tf_index = 0
         clock_period_ns = int(1e9 / self.args.clock_frequency)
         while reader.has_next() and not self.cancelled:
             topic, data, stamp = reader.read_next()
@@ -309,10 +340,21 @@ class Replay:
             if (topic == '/clock' and last_clock_publish_stamp is not None and
                     stamp-last_clock_publish_stamp < clock_period_ns):
                 continue
+            # Supply recorded TF slightly ahead of scans, with original stamps
+            # and values. This avoids a one-slot message filter losing scans
+            # while the recorded EKF callback would have arrived just later.
+            # No interpolation, new frame, or truth transform is generated.
+            limit = stamp*1e-9+self.args.tf_lookahead
+            next_index = publish_tf_until(self.dynamic_tf, tf_index, limit, self.publishers['/tf'].publish)
+            for_message_count['/tf'] += next_index-tf_index
+            tf_index = next_index
+            if topic == '/tf':
+                continue
             due = start_wall + (stamp-first)*1e-9/self.args.rate
             self.spin_for(max(0., due-time.monotonic()))
             message = self.deserialize(data, self.types[topic])
             if topic == '/scan':
+                self.input_scan_stamps.append(stamp_seconds(message.header.stamp))
                 self.scans[round(stamp_seconds(message.header.stamp), 8)] = message
                 # Bound unprocessed scans (motion thresholds legitimately skip many).
                 while len(self.scans) > 200:
@@ -338,6 +380,8 @@ class Replay:
             self.spin_for(.03)
         self.spin_for(1.)
         return {'published': dict(for_message_count), 'cancelled': self.cancelled,
+                'tf_lookahead_sim_s': self.args.tf_lookahead,
+                'tf_values_and_stamps': 'unchanged recorded odom->base_footprint only',
                 'playback_duration_s': (last-first)*1e-9 if first is not None else 0.,
                 'wall_duration_s': time.monotonic()-start_wall}
 
@@ -366,6 +410,7 @@ class Replay:
             writer.writerows(corrections)
         report = {'profile': self.args.profile, 'playback': playback,
                   'processed_scans': len(self.pose_rows), 'truth_published': False,
+                  'localized_scans': len(self.localized_scans),
                   'navigation_acceptance': 'not_evaluated',
                   'acceptance': 'incomplete', 'reason': 'Ground truth/reference/revisits required'}
         provenance = self.args.input/'filter_report.json'
@@ -389,9 +434,12 @@ class Replay:
             if jumps:
                 report.update(acceptance='fail', reason='Unexpected map->odom correction jump')
         log = (directory/'slam.log').read_text(errors='replace')
+        from mapping_events import data_health
+        report['data_health'] = data_health(self.input_scan_stamps, log)
         report['message_filter_failures'] = log.count('Message Filter dropping message')
         if (self.cancelled or not self.pose_rows or self.map is None
-                or report['message_filter_failures'] or diagnostics['missing_odom_brackets']):
+                or len(self.localized_scans) < .95*len(self.pose_rows)
+                or not report['data_health']['complete'] or diagnostics['missing_odom_brackets']):
             report['acceptance'] = 'incomplete'
             report['reason'] = 'Cancelled, missing outputs, or dropped input scans; do not compare as a pass'
         if playback['playback_duration_s'] < 600.:
@@ -403,13 +451,7 @@ class Replay:
 
     def close(self):
         for process in self.processes:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGINT)
-                try:
-                    process.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    process.wait(timeout=5)
+            stop_owned_process(process)
         for stream in self.streams:
             stream.close()
         self.node.destroy_node()
@@ -435,6 +477,8 @@ def main(argv=None):
     run.add_argument('--rate', type=float, default=1., help='Wall-time replay speed; lower if scans are dropped')
     run.add_argument('--clock-frequency', type=float, default=100.,
                      help='Replay /clock publication rate; 100 Hz matches the fastest recorded sensor')
+    run.add_argument('--tf-lookahead', type=float, default=.2,
+                     help='Supply unchanged recorded odom TF this many sim seconds ahead of scans')
     compare = sub.add_parser('compare', help='Filter once and run all four profiles sequentially')
     compare.add_argument('--recording', type=Path, required=True, help='Recorder output directory')
     compare.add_argument('--world', type=Path, required=True)
@@ -442,9 +486,12 @@ def main(argv=None):
     compare.add_argument('--domain', type=int, default=185)
     compare.add_argument('--rate', type=float, default=1.)
     compare.add_argument('--clock-frequency', type=float, default=100.)
+    compare.add_argument('--tf-lookahead', type=float, default=.2)
     compare.add_argument('--params', type=Path)
+    compare.add_argument('--profiles', type=Path)
     compare.add_argument('--compare-profiles', nargs='+', choices=PROFILE_NAMES,
-                         default=['baseline', 'baseline_turn', 'heading_prior', 'heading_prior_turn'],
+                         default=['simulation_stable', 'stable_no_match_control',
+                                  'stable_translation_prior', 'stable_pose_prior'],
                          help='Configurations sharing exactly the same filtered inputs')
     args = parser.parse_args(argv)
     replay = None
@@ -453,29 +500,45 @@ def main(argv=None):
             prepare(args.input, args.output, args.raw_odom)
             return 0
         if (not math.isfinite(args.rate) or args.rate <= 0 or
+                not math.isfinite(args.tf_lookahead) or not 0 <= args.tf_lookahead <= 1. or
                 not math.isfinite(args.clock_frequency) or args.clock_frequency < 100 or
                 args.clock_frequency > 1000 or not 0 <= args.domain <= 232):
-            parser.error('rate must be positive, clock frequency in [100,1000], and domain in 0..232')
+            parser.error('rate must be positive, TF lookahead in [0,1], clock frequency in [100,1000], and domain in 0..232')
         if args.command == 'compare':
             args.output.mkdir(parents=True, exist_ok=False)
             report = prepare(args.recording/'rosbag', args.output/'filtered')
             results = {'input': report, 'profiles': {}}
+            model = args.recording/'runtime_robot_model.json'
+            results['runtime_robot_model'] = json.loads(model.read_text()) if model.exists() else None
             for profile in dict.fromkeys(args.compare_profiles):
                 command = [sys.executable, str(Path(__file__).resolve()), 'run',
                            '--input', str(args.output/'filtered'), '--output', str(args.output/profile),
                            '--recording', str(args.recording), '--world', str(args.world),
                            '--profile', profile, '--domain', str(args.domain), '--rate', str(args.rate),
-                           '--clock-frequency', str(args.clock_frequency)]
+                           '--clock-frequency', str(args.clock_frequency),
+                           '--tf-lookahead', str(args.tf_lookahead)]
                 if args.params:
                     command += ['--params', str(args.params)]
+                if args.profiles:
+                    command += ['--profiles', str(args.profiles)]
                 result = subprocess.run(command, check=False)
                 summary = args.output/profile/'summary.json'
                 results['profiles'][profile] = json.loads(summary.read_text()) if summary.exists() else {
                     'acceptance': 'incomplete', 'exit_code': result.returncode}
                 (args.output/'comparison_summary.json').write_text(json.dumps(results, indent=2))
+            from mapping_events import correction_gate
+            results['prior_gates'] = {name: correction_gate(results['profiles']['simulation_stable'], report)
+                for name, report in results['profiles'].items()
+                if name in ('stable_translation_prior', 'stable_pose_prior')
+                and 'simulation_stable' in results['profiles']}
+            results['default_changed'] = False
+            (args.output/'comparison_summary.json').write_text(json.dumps(results, indent=2))
             # A diagnostic-only winner is never installed as the navigation default.
-            candidate_passed = any(r['acceptance'] == 'pass' for p, r in results['profiles'].items()
-                                   if p not in ('baseline', 'odometry_only'))
+            candidate_passed = (any(g['acceptance'] == 'pass' for g in results['prior_gates'].values())
+                if results['prior_gates'] else any(r['acceptance'] == 'pass'
+                for p, r in results['profiles'].items() if p not in
+                ('baseline', 'odometry_only', 'simulation_stable', 'stable_no_match_control',
+                 'stable_translation_prior', 'stable_pose_prior')))
             incomplete = any(r['acceptance'] == 'incomplete' for r in results['profiles'].values())
             return 0 if candidate_passed and not incomplete else 1
         from ament_index_python.packages import get_package_share_directory

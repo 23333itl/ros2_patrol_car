@@ -15,7 +15,7 @@ rclpy.init()
 node=Node('mapping_test_route',parameter_overrides=[Parameter('use_sim_time',value=True)])
 client=ActionClient(node,NavigateToPose,'navigate_to_pose');buffer=Buffer();listener=TransformListener(buffer,node)
 publisher=node.create_publisher(Twist,'/cmd_vel',10)
-processed=[];events=[];phases=[];active=None;stopping=False
+processed=[];events=[];phases=[];active=None;stopping=False;failed=False
 subscription=node.create_subscription(PoseWithCovarianceStamped,'/pose',lambda m:processed.append(m.header.stamp.sec+m.header.stamp.nanosec*1e-9),100)
 output=Path(sys.argv[1])
 def stop(*_):
@@ -66,10 +66,11 @@ try:
    event=dict(repeat=repeat,waypoint=index,status=result.status,sim_s=node.get_clock().now().nanoseconds*1e-9)
    events.append(event);print(json.dumps(event),flush=True)
    if result.status!=4:raise RuntimeError('Route navigation failed')
-except RuntimeError as error:print(str(error),flush=True)
+except RuntimeError as error:failed=True;print(str(error),flush=True)
 finally:
  publisher.publish(Twist())
  if active:
   try:stopping=False;wait(active.cancel_goal_async(),5)
   except Exception:pass
  output.write_text(json.dumps(events,indent=2));node.destroy_node();rclpy.shutdown()
+sys.exit(1 if failed else 0)

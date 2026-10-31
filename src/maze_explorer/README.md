@@ -1,6 +1,80 @@
 # 迷宫探索与建图诊断
 
-默认使用用户实测准确的 `simulation_stable`，直接运行 `ros2 launch maze_explorer explore_maze.launch.py` 即可加载。早期候选的离线结果见 [2026-10-30 验证记录](docs/mapping_validation_20261030.md)，其中默认保留说明属于当时状态。
+当前工程仿真默认使用用户实测平稳的 `odometry_only`。直接运行 `ros2 launch maze_explorer explore_maze.launch.py`，与显式指定 `world:=/ros_ws_pool/maze_ws/maze_output/maze.world slam_profile:=odometry_only` 使用相同世界和建图参数。当前 `/home/itl/maze_ws` 指向 `/ros_ws_pool/maze_ws`，所以默认世界路径一致。
+
+该模式仍使用激光绘制地图，定位沿用现有轮式里程计与 IMU 融合链路，不再通过扫描匹配修正里程计，减少这类修正导致的 RViz 左右抖动。代价是里程计累积误差不会被激光纠正。`odometry_only` 原参数不变，包括 0.05 m 地图分辨率；不更改底盘、EKF 或导航安全距离。需要恢复扫描匹配时，显式加 `slam_profile:=simulation_stable`。
+
+重新构建并加载工作空间后即可正常使用，下文诊断工具和历史验证步骤均为可选：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /ros_ws_pool/maze_ws/install/setup.bash
+ros2 launch maze_explorer explore_maze.launch.py
+```
+
+需要写日志时，仍可在命令末尾加 `> launch.log 2>&1`；这只是终端输出重定向，不影响建图参数。早期记录中的默认配置说明属于当时状态。
+
+## 历史：保留扫描匹配的抖动对照
+
+以下保留当时使用 `simulation_stable` 的扫描匹配优化记录，不是当前工程启动要求。`lidar_noise_stddev`（m）默认 `0.01`，负数、NaN 和无穷大会在节点启动前报错。启动日志打印选中的 profile、实际噪声、扫描匹配开关与分辨率。需要复现当时配置时显式启动：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /ros_ws_pool/maze_ws/install/setup.bash
+ros2 launch maze_explorer explore_maze.launch.py slam_profile:=simulation_stable
+```
+
+仅在诊断时加 `lidar_noise_stddev:=0`。零噪声用于判断噪声的贡献，不作为正式默认；`odometry_only` 保留原分辨率和扫描阈值，与 `simulation_stable` 不同，不能作为只切换扫描匹配的单变量对照。
+
+三组新 profile 通过 YAML 公共基线继承 `simulation_stable`，保持 `0.025 m` 分辨率、`0.02 m / 0.02 rad` 扫描阈值和关闭回环：
+
+| profile | 相对 `simulation_stable` 唯一变化 |
+|---|---|
+| `stable_no_match_control` | `use_scan_matching: false`，只诊断，不能晋级为默认 |
+| `stable_translation_prior` | `distance_variance_penalty: 0.03`，加强平移里程计先验 |
+| `stable_pose_prior` | 平移先验为 `0.03`，另设 `angle_variance_penalty: 0.003` |
+
+降低两个 variance 参数会加强约束，因为 Karto 内部先将其平方再计算惩罚。候选仍使用激光纠漂；不能仅凭 RViz 画面平滑就替换默认。**2026-10-31 两个先验候选均未通过完整回放，出现大幅定位修正，仅保留用于诊断，不推荐实跑。**默认原值不变，完整数据见 [本轮实现与验证记录](docs/slam_prior_validation_20261031.md)。
+
+`correction_diagnostics.json` 的 `by_motion` 输出静止、直行、转弯、回访及全部/运动期间的修正 P95、最大值、累计量和每仿真秒累计量。使用输入里程计分类，避免候选改变自己的分类；回访是距至少 30 秒、行程至少 1 m 之前的观测位置不超过 0.30 m，与三种运动类别重叠。墙面回访质量仍单独按墙面观测评价。P95 按修正样本计算；晋级使用运动期间 P95，累计量用全部有效里程计时间归一化（包含没有处理扫描的间隔）。空类别输出 `null`，不能视为零误差。修正继续比较同一扫描时刻的 `C_new O(t)` 与 `C_old O(t)`，不直接比较 TF 平移分量。
+
+按固定世界、出生点和同一路线串行采集两个噪声档位（默认每份 610 仿真秒），避免并行仿真争抢资源影响对照。记录器从运行中的 `robot_description` 验证噪声，保存 `runtime_robot_model.json` 和实际 URDF；真值仅记录用于评价：
+
+```bash
+python3 /ros_ws_pool/maze_ws/src/maze_explorer/test/mapping_validation/run_trials.py \
+  --mode noise-control --domain 151 \
+  --output /ros_ws_pool/maze_ws/diagnostics/prior_noise_controls
+```
+
+采集结束后，对两个 `noise_0p01/recording`、`noise_0/recording` **依次**执行以下命令，分别使用新的输出目录：
+
+```bash
+ros2 run maze_explorer replay_mapping.py compare \
+  --recording /ros_ws_pool/maze_ws/diagnostics/prior_noise_controls/noise_0p01/recording \
+  --world /ros_ws_pool/maze_ws/maze_output/maze.world \
+  --output /ros_ws_pool/maze_ws/diagnostics/prior_replay_noise_0p01 \
+  --domain 185 --rate 1
+```
+
+`compare` 默认已改为当前基线及三个新对照，旧配置仍可通过 `--compare-profiles` 显式选择。过滤器排除旧 `map -> odom` 和 SLAM 输出，四组共享同一个输入摘要。回放会查询节点实际的平移、航向惩罚值。`comparison_summary.json` 的 `prior_gates` 要求：运动期间至少一项 P95 降低 30%，另一项恶化不超过 5%，两项单位仿真时间累计量均不得增加超过 5%；候选几何通过且无 `0.10 m / 2°` 单次跳变，并有转弯、回访与至少 600 秒完整输入。诊断对照不参加晋级。
+
+`data_health` 检查 10 Hz 输入扫描间隔（超过 0.15 s 视为缺帧）、消息过滤丢弃，以及连续 3.5 秒内至少三次控制器掉频警告；短时单次掉频会保留记录。数据不完整时不得作为通过。扫描运动阈值造成的正常跳过不作为输入丢帧。
+
+离线回放默认用 `--tf-lookahead 0.2` 提前供应录制中的 `odom -> base_footprint`，保留原始变换值和时间戳，不生成额外里程计、不发布真值。这样让单格激光队列在扫描到达时已有对应 TF，避免加速回放时等待原始 EKF 到达顺序产生的丢帧。四组使用相同策略，`playback` 记录提前量；这只改变离线数据供应顺序，不改变实车/仿真的 TF 或 SLAM 超时设置。若仍丢帧，必须降低 `--rate` 重跑。
+
+异常目录额外保存前后 5 秒的 `scan.jsonl`（原始距离、角度与时间，非法距离为 `null`）和完整录制静态 TF。`event.json` 标明其中 `tf_samples.csv` 来自原录制；候选的修正应读取该候选目录的 `map_to_odom.csv`，不能把原录制的 `map -> odom` 当成回放结果。原始 bag 保留不变。
+
+候选通过两个噪声档位的回放后，再串行运行三次正式噪声 `0.01 m` 巡逻，每次默认 1510 仿真秒。脚本要求两份通过的回放报告：
+
+```bash
+python3 /ros_ws_pool/maze_ws/src/maze_explorer/test/mapping_validation/run_trials.py \
+  --mode patrol --profile stable_pose_prior --domain 151 \
+  --replay-comparisons /ros_ws_pool/maze_ws/diagnostics/prior_replay_noise_0p01/comparison_summary.json \
+    /ros_ws_pool/maze_ws/diagnostics/prior_replay_noise_0/comparison_summary.json \
+  --output /ros_ws_pool/maze_ws/diagnostics/prior_patrol_trials
+```
+
+每轮随后使用 `evaluate_mapping_recording.py --min-duration 1500`，结合 `--launch-log` 与 `--exploration-status` 评价几何、持续推进和探索收尾。只有三轮均通过，才将最优候选的参数写回默认，并保存旧值为 `simulation_stable_previous`。工具不会自动修改默认值；未通过时保留基线，并从首次越界事件目录提取前后 5 秒扫描/TF/速度上下文。
 
 这轮修改统一了全局/局部地图的小车尺寸、膨胀和碰撞预测，探索终点只要求位置到达；前沿目标先检查站位净空和路径，再交给导航。导航长时间无平移时先取消目标，收到终止结果后才运行 Nav2 恢复动作。这样可以减少墙角不可达目标、无意义终点旋转，以及导航和恢复同时发速度的问题。
 
@@ -36,6 +110,10 @@ Smac 2D 的墙边通行代价使用有效参数 `GridBased.cost_travel_multiplie
 
 探索结果除 `.pgm/.yaml` 外会保存 `.status.yaml`，其中 `completed: false` 表示仍有前沿但停滞；不能将其当作完整地图。导航无进展先取消，终止确认后最多一次安全倒车和旋转；地图边缘增长本身不会无限重置恢复次数。
 
+2026-10-31 的后期日志长期显示“原始 16 格、15 个簇、15 个小簇”：选点过滤掉了所有小于 5 格的簇，但旧完成条件只认原始前沿格为零，因此一直静止筛选，未正常收尾。现在选点和收尾共用 `kMinimumFrontierClusterCells=5`。原始前沿为零时仍需五张不同的新鲜地图；仅剩小簇时还需持续稳定 `completion_confirmation_time=10.0` 个仿真秒。确认期间丢弃旧候选、不导航、不恢复；有效簇重现、地图/TF 过期或车体不在可信自由区时清空确认窗口。
+
+有效簇在可达性、距离、黑名单及冷却过滤之前计数，因此“目标都被排除”或“有较大前沿但路径不可达”仍属于未完成，继续遵守有界恢复和可恢复等待机制。完成表示当前五格阈值下的有效前沿耗尽，并不声称地图所有未知像素已消失。状态文件增加 `completion_criterion`、`minimum_frontier_cluster_cells`、`raw_frontier_cells`、`significant_frontier_clusters` 和 `ignored_small_frontier_cells`，明确记录收尾依据；地图中的未知格原样保留。收尾后停止探索定时器，Gazebo、SLAM 和 RViz 继续保留，便于查看结果。
+
 SLAM 由专用 `lifecycle_manager_slam` 通过服务配置、激活，`bond_timeout=0.0`。这样既避免依赖一次启动状态事件而漏激活，也不启用曾造成误重启的心跳监测。
 
 ## 减少选点停顿与轻微定位修正
@@ -50,7 +128,7 @@ SLAM 由专用 `lifecycle_manager_slam` 通过服务配置、激活，`bond_time
 
 当前用户的 `simulation_stable` 已覆盖扫描阈值 `0.02 m / 0.02 rad`。这只让较小运动有机会触发扫描处理，不能保证单次定位修正更小；继续降低还会增加计算负载。Fixed Frame 在 `map` / `odom` 间切换时，若分别表现为小车 / 地图轻微移动，优先记录 `map -> odom` 修正，而非调整轮子或 EKF。[REP-105](https://github.com/ros-infrastructure/rep/blob/master/rep-0105.rst) 规定 `odom` 中位姿连续，`map` 中允许离散定位修正。使用下方诊断工具记录后，查看 `correction_diagnostics.json` 中的 `max_position_step_m`、`max_abs_yaw_step_deg` 和 `processed_scan_intervals.csv`；单次超过 `0.10 m / 2°` 时再依据对应扫描与 TF 排查。正式定位 TF 不做显示平滑，RViz 保持时间同步关闭。
 
-本次已重新构建，26 项 C++ 单元测试及 8 项隔离 ROS Action 回归测试通过，包括不安全路径拒绝、重试预算、短目标机会、远处可行目标继续参与选择，以及取消终止后才恢复。当前没有运行中的仿真，本次未完成迷宫实跑验收，也未实测消除轻微抖动。
+本次退出逻辑已重新构建，30 项 C++ 单元测试及 10 项隔离 ROS Action 回归测试通过，包括碎片前沿收尾、有效前沿重现时清空确认、不安全路径拒绝、重试预算、短目标机会、远处可行目标继续参与选择，以及取消终止后才恢复。本次未完成迷宫实跑验收，也未实测消除轻微抖动。
 
 ## 一条命令记录
 
@@ -122,7 +200,7 @@ gz topic -e --json-output -n 1 -t /world/maze/dynamic_pose/info
 
 ## 建图偏移的分阶段对照
 
-`slam_profile` 在 `slam_params` 基础上覆盖少量参数，启动日志会打印选中的配置。根据用户实测及明确要求，默认已切换为 `simulation_stable`，与显式传入 `slam_profile:=simulation_stable` 的参数完全一致。需要旧配置作对照时可传 `slam_profile:=baseline`。
+`slam_profile` 在 `slam_params` 基础上覆盖少量参数，启动日志会打印选中的配置。当前工程默认是 `odometry_only`，与显式传入 `slam_profile:=odometry_only` 的参数完全一致。扫描匹配配置仍可通过 `slam_profile:=simulation_stable` 或 `slam_profile:=baseline` 选择。
 
 | profile | 改变及原因 |
 |---|---|
@@ -131,8 +209,8 @@ gz topic -e --json-output -n 1 -t /world/maze/dynamic_pose/info
 | `near_chains` | 使用传感器位姿判断邻近关系，关联半径 `0.30 m`、响应门槛 `0.70`，减少相似走廊的错误关联机会 |
 | `heading_prior` | 在上项基础上，角度先验参数 `0.02`、惩罚下限 `0.50`，粗搜索 ±3° / 步长 0.5°，精搜索步长 0.05°，关闭自动扩大搜索；限制对已验证准确的融合航向的额外修正 |
 | `heading_prior_turn` | 与 `heading_prior` 参数相同，仅额外启用精确距离/角度筛选；长时验收前显式试用 |
-| `simulation_stable` | 默认配置，用户已实测建图准确。强化融合航向先验，保留顺序扫描匹配，以 `1.1` 门槛关闭无先验邻近链；不开回环，避免对称走廊误约束。历史离线回放尚未达到全部几何验收指标 |
-| `odometry_only` | 关闭扫描匹配，仅用于判断漂移是否由扫描匹配引入，不作为导航默认值 |
+| `simulation_stable` | 可选扫描匹配配置。强化融合航向先验，保留顺序扫描匹配，以 `1.1` 门槛关闭无先验邻近链；不开回环 |
+| `odometry_only` | 当前工程仿真默认，关闭扫描匹配，按融合里程计定位、用激光绘图，减少扫描匹配纠正造成的跳动 |
 
 `do_loop_closing: false` 不会关闭 Karto 的邻近扫描链匹配。`angle_variance_penalty` 在本版本内部会平方，调小会加强连续匹配的航向约束；邻近链匹配不使用该惩罚，因而还需要关联距离和响应门槛。`fine_search_angle_offset` 在精匹配实现中作为角度步长使用。实现依据：[slam_toolbox 2.8.5 参数](https://github.com/SteveMacenski/slam_toolbox/blob/2.8.5/src/slam_mapper.cpp)、[Karto 匹配与关联](https://github.com/SteveMacenski/slam_toolbox/blob/2.8.5/lib/karto_sdk/src/Mapper.cpp)。
 
@@ -212,7 +290,7 @@ ros2 launch maze_explorer explore_maze.launch.py \
 ros2 param get /slam_toolbox check_min_dist_and_heading_precisely
 ```
 
-默认现为用户实测的 `simulation_stable`，物理模型、EKF、TF 超时保持现有值。该配置输出栅格为 0.025 m，匹配搜索网格为 0.3 m / 0.01 m / 0.1 m；其余覆盖项见上表与 `slam_profiles.yaml`。
+当前默认为 `odometry_only`，输出栅格为 0.05 m，物理模型、EKF、TF 超时保持现有值。显式选择 `simulation_stable` 时，输出栅格为 0.025 m，匹配搜索网格为 0.3 m / 0.01 m / 0.1 m；其余覆盖项见 `slam_profiles.yaml`。
 
 另开终端录制长时巡逻（1510 秒为 rosbag 订阅启动预留余量，验收仍要求实际记录至少 1500 秒）：
 

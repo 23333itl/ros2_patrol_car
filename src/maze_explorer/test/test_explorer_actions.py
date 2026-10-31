@@ -63,6 +63,8 @@ class FakeNav2(Node):
         self.publish_scans = True
         self.scan_span = 2.0 * math.pi
         self.has_frontiers = True
+        self.residual_frontiers = False
+        self.lifecycle_active = True
         self.robot_cell_free = True
         self.lifecycle_requests = 0
         self.counts = dict(plan=0, navigation=0, backup=0, spin=0)
@@ -110,8 +112,9 @@ class FakeNav2(Node):
         del request
         with self.lock:
             self.lifecycle_requests += 1
-        response.current_state.id = State.PRIMARY_STATE_ACTIVE
-        response.current_state.label = 'active'
+        response.current_state.id = (State.PRIMARY_STATE_ACTIVE if self.lifecycle_active
+                                     else State.PRIMARY_STATE_INACTIVE)
+        response.current_state.label = 'active' if self.lifecycle_active else 'inactive'
         return response
 
     @staticmethod
@@ -177,6 +180,11 @@ class FakeNav2(Node):
             for y in range(8, 12):
                 for x in range(14, 19):
                     data[y * 20 + x] = -1
+        if self.residual_frontiers:
+            # Twelve raw frontier cells, split into four separate three-cell
+            # clusters. Their total exceeds five, but none qualifies as a target.
+            for x, y in ((14, 8), (14, 12), (6, 5), (6, 14)):
+                data[y * 20 + x] = -1
         if not self.robot_cell_free:
             data[10 * 20 + 10] = -1  # Robot at world (0, 0) is outside known free space.
         grid.data = data
@@ -350,6 +358,39 @@ class ExplorerHarness:
 
 
 class ExplorerActionTests(unittest.TestCase):
+    def test_small_residual_clusters_finish_without_navigation_or_recovery(self):
+        with ExplorerHarness(8, frontiers=False, stream_scans=False) as h:
+            h.fake.residual_frontiers = True
+            h.fake.lifecycle_active = False
+            h.wait_for(lambda: 'status: completed' in h.status(), 12.0,
+                       'stable residual-only maps complete even without recovery readiness')
+            status = h.status()
+            self.assertIn('completed: true', status)
+            self.assertIn('resumable: false', status)
+            self.assertIn('map_saved: true', status)
+            self.assertIn('raw_frontier_cells: 12', status)
+            self.assertIn('significant_frontier_clusters: 0', status)
+            self.assertIn('ignored_small_frontier_cells: 12', status)
+            self.assertEqual(sum(h.fake.counts.values()), 0)
+            h.fake.has_frontiers = True
+            h.sim_wait(6.0)
+            self.assertEqual(h.status(), status, 'finished exploration restarted itself')
+            self.assertEqual(sum(h.fake.counts.values()), 0)
+
+    def test_significant_frontier_interrupts_residual_completion_window(self):
+        with ExplorerHarness(9, frontiers=False, no_progress_timeout=100.0) as h:
+            h.fake.residual_frontiers = True
+            h.wait_for(lambda: '确认收尾中' in h.log_path.read_text(encoding='utf-8'),
+                       8.0, 'residual-only confirmation begins')
+            h.sim_wait(3.0)
+            h.fake.has_frontiers = True
+            h.wait_for(lambda: h.fake.counts['navigation'] == 1, 8.0,
+                       'a real frontier resumes normal goal selection before completion')
+            h.sim_wait(12.0)
+            self.assertNotIn('completed: true', h.status())
+            self.assertEqual(h.fake.counts['backup'], 0)
+            self.assertEqual(h.fake.counts['spin'], 0)
+
     def test_bounded_rounds_try_short_goals_and_do_not_starve_far_safe_goals(self):
         with ExplorerHarness(7, no_progress_timeout=100.0) as h:
             h.fake.large_room = True
@@ -548,8 +589,8 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--scenario', choices=['all', 'cancel', 'complete', 'stalled',
                                                'interrupted', 'recovery_scan', 'selection', 'handoff',
-                                               'fairness'],
-                        default='all', help='run one regression scenario or all eight')
+                                               'fairness', 'residual', 'residual_interrupted'],
+                        default='all', help='run one regression scenario or all ten')
     parser.add_argument('--executable', '--explorer-binary', dest='explorer_binary', type=Path,
                         default=workspace / 'install/maze_explorer/lib/maze_explorer/explorer_node')
     parser.add_argument('--domain-id', type=int, default=40 + os.getpid() % 100,
@@ -575,6 +616,8 @@ def main():
         'selection': 'test_unsafe_paths_and_cooldowns_cannot_extend_selection_indefinitely',
         'handoff': 'test_lifecycle_refresh_during_navigation_avoids_goal_handoff_pause',
         'fairness': 'test_bounded_rounds_try_short_goals_and_do_not_starve_far_safe_goals',
+        'residual': 'test_small_residual_clusters_finish_without_navigation_or_recovery',
+        'residual_interrupted': 'test_significant_frontier_interrupts_residual_completion_window',
     }
     selected = names.values() if OPTIONS.scenario == 'all' else [names[OPTIONS.scenario]]
     suite = unittest.TestSuite(ExplorerActionTests(name) for name in selected)

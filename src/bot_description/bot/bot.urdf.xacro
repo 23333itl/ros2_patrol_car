@@ -6,6 +6,7 @@
          AMCL 缺少激光输入便无法发布 map -> odom，RViz 机器人模型会全部报无 TF。
          lidar_type 由 launch 传入；需要相机时再传 enable_camera:=true。 -->
     <xacro:arg name="lidar_type" default="gpu_lidar"/>
+    <xacro:arg name="lidar_noise_stddev" default="0.01"/>
     <xacro:arg name="enable_camera" default="false"/>
 
     <xacro:include filename ="$(find bot_description)/bot/base.urdf.xacro"/>

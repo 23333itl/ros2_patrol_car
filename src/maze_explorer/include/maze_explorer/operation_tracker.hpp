@@ -12,6 +12,30 @@ namespace maze_explorer
 {
 enum class Phase { Idle, Waiting, Planning, Sending, Navigating, Canceling, BackingUp, Spinning, Finished };
 
+// Confirmation is based on distinct fresh map observations, never timer ticks.
+// Residual clusters need a quiet interval as well as the existing five-map rule.
+class CompletionEvidence
+{
+public:
+  explicit CompletionEvidence(double quiet_time = 10.0) : quiet_time_(quiet_time) {}
+  bool observe(double time, std::uint64_t revision, bool has_small_frontiers)
+  {
+    if (maps_ == 0) {started_ = time;}
+    if (maps_ == 0 || revision != last_revision_) {++maps_; last_revision_ = revision;}
+    residual_ = residual_ || has_small_frontiers;
+    return maps_ >= 5 && (!residual_ || time - started_ >= quiet_time_);
+  }
+  bool active() const {return maps_ > 0;}
+  bool hasResidual() const {return residual_;}
+  void reset() {maps_ = 0; residual_ = false;}
+
+private:
+  double quiet_time_, started_{0.0};
+  std::size_t maps_{0};
+  std::uint64_t last_revision_{0};
+  bool residual_{false};
+};
+
 // A temporary exclusion is different from a progress-locked short observation.
 class GoalExclusions
 {

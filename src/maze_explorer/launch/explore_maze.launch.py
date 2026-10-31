@@ -11,6 +11,7 @@
   ros2 launch maze_explorer explore_maze.launch.py map_save_path:=/tmp/my_map
 """
 
+import math
 import os
 import tempfile
 
@@ -23,6 +24,7 @@ from launch.actions import (
     LogInfo,
     OpaqueFunction,
     SetEnvironmentVariable,
+    SetLaunchConfiguration,
     TimerAction,
 )
 from launch.conditions import IfCondition, UnlessCondition
@@ -30,6 +32,23 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node, SetParameter
 from launch_ros.substitutions import FindPackageShare
+
+
+def _lidar_noise_stddev(value):
+    """Validate before xacro/Gazebo starts; zero is a diagnostic option only."""
+    try:
+        noise = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('lidar_noise_stddev must be a finite, nonnegative number (m)') from exc
+    if not math.isfinite(noise) or noise < 0:
+        raise ValueError('lidar_noise_stddev must be a finite, nonnegative number (m)')
+    return noise
+
+
+def _validate_lidar_noise(context):
+    noise = _lidar_noise_stddev(LaunchConfiguration('lidar_noise_stddev').perform(context))
+    return [SetLaunchConfiguration('lidar_noise_stddev', str(noise)),
+            LogInfo(msg=f'LiDAR noise stddev: {noise:g} m (zero is diagnostic only)')]
 
 
 def _read_maze_info(world_path):
@@ -117,10 +136,11 @@ def _slam_nav2_nodes(context):
         profiles = yaml.safe_load(f)
     if slam_profile not in profiles:
         raise ValueError(f'Unknown slam_profile {slam_profile!r}; choose {list(profiles)}')
+    with open(slam_params, 'r', encoding='utf-8') as f:
+        slam_config = yaml.safe_load(f)
+    slam_values = slam_config['slam_toolbox']['ros__parameters']
+    slam_values.update(profiles[slam_profile])
     if profiles[slam_profile]:
-        with open(slam_params, 'r', encoding='utf-8') as f:
-            slam_config = yaml.safe_load(f)
-        slam_config['slam_toolbox']['ros__parameters'].update(profiles[slam_profile])
         slam_file = tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False)
         yaml.safe_dump(slam_config, slam_file)
         slam_file.close()
@@ -166,6 +186,10 @@ def _slam_nav2_nodes(context):
 
     return [
         LogInfo(msg=f'SLAM profile: {slam_profile}; parameters: {slam_params}'),
+        LogInfo(msg=f'SLAM resolved: lidar_noise_stddev='
+                    f'{LaunchConfiguration("lidar_noise_stddev").perform(context)} m; '
+                    f'use_scan_matching={slam_values.get("use_scan_matching", True)}; '
+                    f'resolution={slam_values.get("resolution", 0.05)} m'),
         LogInfo(msg=f'探索完成后的地图保存路径：{map_save_path}.pgm/.yaml'),
         # ---- 在线建图：生命周期服务可靠启动，避免启动事件丢失后停在 inactive ----
         IncludeLaunchDescription(
@@ -229,6 +253,7 @@ def generate_launch_description():
     robot_description = Command([
         'xacro ', os.path.join(bot_share, 'bot', 'bot.urdf.xacro'),
         ' lidar_type:=', LaunchConfiguration('lidar_type'),
+        ' lidar_noise_stddev:=', LaunchConfiguration('lidar_noise_stddev'),
         ' enable_camera:=', LaunchConfiguration('camera'),
     ])
     robot_state_publisher = Node(
@@ -265,9 +290,11 @@ def generate_launch_description():
             default_value=os.path.join(explorer_share, 'config', 'slam_toolbox.yaml'),
             description='slam_toolbox 参数文件路径'),
         DeclareLaunchArgument(
-            'slam_profile', default_value='simulation_stable',
-            description='SLAM 对照配置：baseline / baseline_turn / near_chains / heading_prior / heading_prior_turn / '
-                        'simulation_stable（默认，用户已实测的无回环配置）/ odometry_only（仅用于诊断）'),
+            'slam_profile', default_value='odometry_only',
+            description='工程仿真默认 odometry_only：按融合里程计定位，激光绘图但不做扫描匹配纠漂；'
+                        'simulation_stable 可显式恢复扫描匹配；baseline / baseline_turn / near_chains / '
+                        'heading_prior / heading_prior_turn / stable_no_match_control 为可选对照；'
+                        'stable_translation_prior / stable_pose_prior 本轮未通过，仅诊断'),
         DeclareLaunchArgument(
             'map_save_path', default_value='explored_maze',
             description='探索完成后的地图保存路径（不含扩展名）'),
@@ -288,6 +315,9 @@ def generate_launch_description():
             'lidar_type', default_value='gpu_lidar',
             description='雷达类型：gpu_lidar=Gazebo Sim 8 可用雷达（默认）；'
                         'ray 不受支持，仅保留参数以兼容旧命令'),
+        DeclareLaunchArgument(
+            'lidar_noise_stddev', default_value='0.01',
+            description='激光高斯噪声标准差（m），须为有限非负数；0 仅用于噪声对照'),
         DeclareLaunchArgument(
             'camera', default_value='false',
             description='是否启用深度相机（当前导航链路不用；需要 GPU/EGL 正常）'),
@@ -310,6 +340,7 @@ def generate_launch_description():
         # 全局使用仿真时间：Gazebo 里的 TF / odom 时间戳都是仿真时间
         SetParameter(name='use_sim_time', value=True),
 
+        OpaqueFunction(function=_validate_lidar_noise),
         robot_state_publisher,
 
         # ==================== 2. 启动 Gazebo + 迷宫世界 ====================

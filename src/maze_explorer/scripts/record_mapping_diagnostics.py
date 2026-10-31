@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 
 
 def stamp_seconds(stamp):
@@ -171,6 +172,9 @@ class Diagnostics:
         self.parameter_client = self.node.create_client(GetParameters, '/slam_toolbox/get_parameters')
         self.parameter_future = None
         self.runtime_parameters = None
+        self.model_client = self.node.create_client(GetParameters, '/robot_state_publisher/get_parameters')
+        self.model_future = None
+        self.runtime_model = None
         self.residual_csv = self.output.writer('scan_map_residual.csv', [
             'scan_stamp_s', 'map_stamp_s', 'points', 'median_m', 'p95_m', 'max_m'])
         self.latest_map = None
@@ -296,6 +300,23 @@ class Diagnostics:
 
     def sample_publishers(self):
         from rcl_interfaces.srv import GetParameters
+        if self.runtime_model is None:
+            if self.model_future is None and self.model_client.service_is_ready():
+                self.model_future = self.model_client.call_async(GetParameters.Request(names=['robot_description']))
+            elif self.model_future is not None and self.model_future.done():
+                response = self.model_future.result()
+                if response.values and response.values[0].string_value:
+                    description = response.values[0].string_value
+                    sensor = ET.fromstring(description).find(".//sensor[@name='lidar']")
+                    noise = float(sensor.findtext('lidar/noise/stddev')) if sensor is not None else math.nan
+                    if not math.isfinite(noise) or noise < 0:
+                        raise ValueError('Runtime robot_description has no valid lidar noise standard deviation')
+                    self.runtime_model = {'lidar_noise_stddev_m': noise,
+                                          'sensor_type': sensor.get('type')}
+                    (self.args.output/'runtime_robot_model.json').write_text(json.dumps(self.runtime_model, indent=2))
+                    (self.args.output/'robot_description.urdf').write_text(description)
+                else:
+                    self.model_future = None
         if self.runtime_parameters is None:
             if self.parameter_future is None and self.parameter_client.service_is_ready():
                 self.parameter_future = self.parameter_client.call_async(
@@ -465,8 +486,10 @@ class Diagnostics:
                 self.sample_slam()
                 self.sample_scan_map()
                 last_slam_poll = now
-            if self.args.duration > 0 and self.start_sim is not None:
-                if self.now() - self.start_sim >= self.args.duration:
+            if self.args.duration > 0 and self.start_sim is not None and self.last_clock is not None:
+                # Stop and report against the same /clock samples. The node's
+                # TimeSource can be one 1-ms tick ahead of our callback.
+                if self.last_clock - self.start_sim >= self.args.duration:
                     break
             if self.args.wall_timeout > 0 and now - started >= self.args.wall_timeout:
                 self.event('wall_timeout', str(self.args.wall_timeout))
@@ -568,6 +591,10 @@ class Diagnostics:
         for topic in ('/tf', '/tf_static'):
             if not any(name.startswith(topic + ':') for name in self.statistics):
                 missing.append(topic)
+        if self.runtime_parameters is None:
+            missing.append('runtime_slam_parameters')
+        if self.runtime_model is None:
+            missing.append('runtime_robot_description')
         summary = {
             'status': 'incomplete' if missing or self.clock_reset or self.ground_truth_error or self.runtime_error else 'recorded',
             'missing_streams': missing, 'clock_reset': self.clock_reset,
@@ -576,6 +603,7 @@ class Diagnostics:
             'recorded_duration_sim_s': (self.last_clock-self.start_sim
                                       if self.start_sim is not None else 0.),
             'requested_duration_sim_s': self.args.duration,
+            'runtime_robot_model': self.runtime_model,
             'streams': self.statistics, 'comparison': results, 'detected_turns': turns,
             'correction_diagnostics': correction_report,
             'notes': ['recorded is a data-availability status, not a mapping-quality pass',

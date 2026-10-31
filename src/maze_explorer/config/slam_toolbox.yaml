@@ -9,7 +9,7 @@ slam_toolbox:
     map_frame: map
     scan_topic: /scan
     mode: mapping
-    # 正式基线保持激光匹配；对照配置通过 slam_profile 显式选择。
+    # 原始扫描匹配基线；launch 默认用 odometry_only 覆盖此开关，其他参数保留。
     use_scan_matching: true
     # 雷达量程与 bot 的 gpu_lidar 配置一致
     max_laser_range: 8.0
