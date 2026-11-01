@@ -129,6 +129,126 @@ TEST(FrontierSearch, FullPathCheckRejectsWallBetweenClearEndpoints)
   EXPECT_TRUE(maze_explorer::segmentFootprintFree(map, .4, .4, .6, .6, .14));
 }
 
+nav_msgs::msg::Path pathThrough(std::initializer_list<std::pair<double, double>> points)
+{
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  for (const auto & p : points) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.pose.position.x = p.first; pose.pose.position.y = p.second;
+    pose.pose.orientation.w = 1.0;
+    path.poses.push_back(pose);
+  }
+  return path;
+}
+
+TEST(PathFromPose, ReconnectsRoundedStartButKeepsCompleteBodyCheck)
+{
+  auto map = makeMap(40, 20, .025F, 0);
+  fillRectangle(map, 0, 0, 39, 3, 100);
+  const auto path = pathThrough({{.30, .225}, {.325, .25}, {.50, .25}});
+  EXPECT_TRUE(footprintFree(map, .30, .245, .13));
+  EXPECT_FALSE(footprintFree(map, .30, .225, .13));
+  const auto check = maze_explorer::checkPathFromPose(map, path, .30, .245, .13);
+  EXPECT_TRUE(check.safe);
+  EXPECT_EQ(check.joined_at, 1U);
+  EXPECT_GT(check.length, .17);
+}
+
+TEST(PathFromPose, DoesNotReconnectPastFiveCentimetersOrSkipMiddleCollision)
+{
+  auto map = makeMap(60, 30, .025F, 0);
+  fillRectangle(map, 0, 0, 59, 3, 100);
+  EXPECT_FALSE(maze_explorer::checkPathFromPose(map,
+    pathThrough({{.30, .225}, {.36, .25}}), .30, .245, .13).safe);
+  fillRectangle(map, 28, 0, 29, 29, 100);
+  const auto middle = maze_explorer::checkPathFromPose(map,
+    pathThrough({{.30, .25}, {1.10, .25}}), .30, .25, .13);
+  EXPECT_FALSE(middle.safe);
+  EXPECT_FALSE(middle.start_blocked);
+  EXPECT_FALSE(maze_explorer::checkPathFromPose(map,
+    pathThrough({{.30, .225}, {.325, .25}}), .30, .22, .13).safe);
+}
+
+TEST(FrontierSearch, ClearanceWaypointIncreasesClearanceWithoutCrossingWall)
+{
+  auto map = makeMap(60, 40, .025F, 0);
+  fillRectangle(map, 0, 0, 59, 3, 100);
+  const auto points = maze_explorer::clearanceWaypoints(map, .50, .245, .13, .025);
+  ASSERT_FALSE(points.empty());
+  for (const auto & c : points) {
+    EXPECT_GE(c.path_distance + 1e-9, .15);
+    EXPECT_LE(c.path_distance, .35 + 1e-9);
+    EXPECT_TRUE(goalFootprintFree(map, c.x, c.y, .13, .025));
+    EXPECT_TRUE(maze_explorer::segmentFootprintFree(map, .50, .245, c.x, c.y, .13));
+    EXPECT_GE(maze_explorer::obstacleClearance(map, c.x, c.y), .165 - 1e-6);
+  }
+}
+
+TEST(FrontierSearch, SmallVisibleFrontierIsActionableEvenWhenAllGoalsCooling)
+{
+  auto map = makeMap(40, 30, .05F, 0);
+  // One unknown cell has an eight-cell frontier; cover five neighbors to leave
+  // a genuine three-cell opening rather than a minimum-size-five cluster.
+  fillRectangle(map, 23, 0, 39, 29, 100);
+  map.data[15 * 40 + 23] = -1;
+  const auto search = findCandidates(map, .5, .775, .13, {});
+  EXPECT_GT(search.small_clusters, 0U);
+  EXPECT_GT(search.actionable_frontier_cells, 0U);
+  ASSERT_FALSE(search.candidates.empty());
+  const auto cooling = findCandidates(map, .5, .775, .13,
+    [](double, double) {return true;});
+  EXPECT_TRUE(cooling.candidates.empty());
+  EXPECT_EQ(search.actionable_frontier_cells, cooling.actionable_frontier_cells);
+  EXPECT_EQ(search.unresolved_frontier_cells, cooling.unresolved_frontier_cells);
+}
+
+TEST(FrontierSearch, InvisibleTinyWallSpeckIsResidualButUnknownRoomIsNot)
+{
+  auto map = makeMap(30, 30, .05F, 100);
+  fillRectangle(map, 3, 3, 18, 18, 0);
+  map.data[19 * 30 + 19] = -1;  // Only diagonal contact through occupied corners.
+  const auto speck = findCandidates(map, .5, .5, .13, {});
+  EXPECT_EQ(speck.frontier_cells, 1U);
+  EXPECT_EQ(speck.residual_frontier_cells, 1U);
+  EXPECT_EQ(speck.actionable_frontier_cells + speck.unresolved_frontier_cells, 0U);
+  fillRectangle(map, 19, 19, 24, 24, -1);
+  const auto room = findCandidates(map, .5, .5, .13, {});
+  EXPECT_GT(room.unresolved_frontier_cells, 0U);
+  EXPECT_EQ(room.residual_frontier_cells, 0U);
+}
+
+TEST(PathFromPose, RecordedEndgameStartCanReconnectWithUnchangedRadius)
+{
+  const auto fixture = std::filesystem::path(__FILE__).parent_path() /
+    "fixtures" / "recorded_endgame.pgm";
+  std::ifstream stream(fixture, std::ios::binary);
+  ASSERT_TRUE(stream.is_open());
+  std::string magic; unsigned int w, h; int maximum;
+  stream >> magic >> w >> h >> maximum; stream.get();
+  ASSERT_EQ(magic, "P5"); ASSERT_EQ(maximum, 255);
+  auto map = makeMap(w, h, .025F, -1);
+  map.info.origin.position.x = -.437813;
+  map.info.origin.position.y = -.424375;
+  for (int y = static_cast<int>(h) - 1; y >= 0; --y) {
+    for (unsigned int x = 0; x < w; ++x) {
+      const int p = stream.get();
+      ASSERT_NE(p, std::char_traits<char>::eof());
+      map.data[static_cast<std::size_t>(y) * w + x] = p == 205 ? -1 : p < 100 ? 100 : 0;
+    }
+  }
+  EXPECT_TRUE(footprintFree(map, 4.49, 6.30, .13));
+  EXPECT_FALSE(maze_explorer::segmentFootprintFree(map, 4.49, 6.28, 4.51, 6.28, .13));
+  const auto check = maze_explorer::checkPathFromPose(map,
+    pathThrough({{4.49, 6.28}, {4.51, 6.28}, {4.60, 6.31}}), 4.49, 6.30, .13);
+  EXPECT_TRUE(check.safe);
+  EXPECT_EQ(check.joined_at, 1U);
+  const auto search = findCandidates(map, 4.49, 6.30, .13, {}, .025);
+  EXPECT_EQ(search.frontier_cells, 87U);
+  EXPECT_GT(search.actionable_frontier_cells, 0U);
+  EXPECT_FALSE(search.candidates.empty());
+}
+
 TEST(FrontierSearch, UsesShortApproachAfterRetreatFromOccludedFrontier)
 {
   const auto map = shortApproachMap();

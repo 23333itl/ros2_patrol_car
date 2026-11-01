@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "nav_msgs/msg/occupancy_grid.hpp"
+#include "nav_msgs/msg/path.hpp"
 
 namespace maze_explorer
 {
@@ -32,6 +33,9 @@ struct SearchResult
   // planner can exhaust the ordinary batch before trying short approaches.
   std::vector<Candidate> short_candidates;
   std::size_t frontier_cells = 0;
+  // Independent of distance/cooldown filters: neither can make exploration complete.
+  std::size_t actionable_frontier_cells = 0, residual_frontier_cells = 0;
+  std::size_t unresolved_frontier_cells = 0;
   bool robot_in_known_free = false;
   bool robot_footprint_free = false;
   std::size_t reachable_cells = 0, frontier_clusters = 0, small_clusters = 0;
@@ -219,6 +223,134 @@ inline bool segmentFootprintFree(
   return true;
 }
 
+struct PathCheck
+{
+  bool safe = false, start_blocked = false;
+  double length = 0.0, ax = 0.0, ay = 0.0, bx = 0.0, by = 0.0;
+  std::size_t joined_at = 0;
+};
+
+// A grid planner may round a safe actual pose toward a wall. Reconnect only
+// its first 5 cm; this never excuses a collision farther along the route.
+inline PathCheck checkPathFromPose(
+  const nav_msgs::msg::OccupancyGrid & map, const nav_msgs::msg::Path & path,
+  double rx, double ry, double radius)
+{
+  PathCheck result;
+  result.ax = result.bx = rx; result.ay = result.by = ry;
+  if (path.poses.empty() || !footprintFree(map, rx, ry, radius)) {return result;}
+  double prefix = 0.0;
+  for (std::size_t join = 0; join < path.poses.size(); ++join) {
+    const auto & p = path.poses[join].pose.position;
+    if (join > 0) {
+      const auto & a = path.poses[join - 1].pose.position;
+      prefix += std::hypot(p.x - a.x, p.y - a.y);
+    }
+    if (!std::isfinite(prefix) || prefix > 0.05 + 1e-9 ||
+      std::hypot(p.x - rx, p.y - ry) > 0.05 + 1e-9) {break;}
+    result.ax = rx; result.ay = ry; result.bx = p.x; result.by = p.y;
+    result.start_blocked = true;
+    if (!segmentFootprintFree(map, rx, ry, p.x, p.y, radius)) {continue;}
+    double length = std::hypot(p.x - rx, p.y - ry);
+    bool safe = true;
+    for (std::size_t i = join + 1; i < path.poses.size(); ++i) {
+      const auto & a = path.poses[i - 1].pose.position;
+      const auto & b = path.poses[i].pose.position;
+      if (!segmentFootprintFree(map, a.x, a.y, b.x, b.y, radius)) {
+        result.ax = a.x; result.ay = a.y; result.bx = b.x; result.by = b.y;
+        result.start_blocked = std::hypot(a.x - rx, a.y - ry) <= 0.05 + 1e-9 &&
+          std::hypot(b.x - rx, b.y - ry) <= 0.05 + 1e-9;
+        safe = false;
+        break;
+      }
+      length += std::hypot(b.x - a.x, b.y - a.y);
+    }
+    if (safe) {
+      result.safe = true; result.length = length; result.joined_at = join;
+      return result;
+    }
+    if (!result.start_blocked) {return result;}
+  }
+  return result;
+}
+
+// Supercover traversal: a ray through a blocked grid corner is not visibility.
+inline bool seesUnknownLocal(
+  const nav_msgs::msg::OccupancyGrid & map, double x, double y, int tx, int ty)
+{
+  const double r = map.info.resolution;
+  int cx = static_cast<int>(std::floor(x / r)), cy = static_cast<int>(std::floor(y / r));
+  const double dx = (tx + 0.5) * r - x, dy = (ty + 0.5) * r - y;
+  const int sx = dx >= 0 ? 1 : -1, sy = dy >= 0 ? 1 : -1;
+  const double inf = std::numeric_limits<double>::infinity();
+  const double stepx = dx == 0 ? inf : r / std::abs(dx);
+  const double stepy = dy == 0 ? inf : r / std::abs(dy);
+  double nextx = dx == 0 ? inf : ((cx + (sx > 0)) * r - x) / dx;
+  double nexty = dy == 0 ? inf : ((cy + (sy > 0)) * r - y) / dy;
+  for (std::size_t n = 0; n < map.info.width + map.info.height + 2U; ++n) {
+    if (cx == tx && cy == ty) {return true;}
+    if (!detail::freeCell(map, cx, cy)) {return false;}
+    if (std::abs(nextx - nexty) < 1e-12) {
+      if (!detail::freeCell(map, cx + sx, cy) ||
+        !detail::freeCell(map, cx, cy + sy)) {return false;}
+      cx += sx; cy += sy; nextx += stepx; nexty += stepy;
+    } else if (nextx < nexty) {cx += sx; nextx += stepx;}
+    else {cy += sy; nexty += stepy;}
+  }
+  return false;
+}
+
+inline double obstacleClearance(
+  const nav_msgs::msg::OccupancyGrid & map, double wx, double wy, double maximum = 0.40)
+{
+  int cx, cy;
+  if (!worldToCell(map, wx, wy, cx, cy)) {return 0.0;}
+  const double yaw = detail::originYaw(map), r = map.info.resolution;
+  const double dx = wx - map.info.origin.position.x, dy = wy - map.info.origin.position.y;
+  const double x = std::cos(yaw) * dx + std::sin(yaw) * dy;
+  const double y = -std::sin(yaw) * dx + std::cos(yaw) * dy;
+  double best = std::min({maximum, x, y, map.info.width * r - x, map.info.height * r - y});
+  const int span = static_cast<int>(std::ceil(maximum / r)) + 1;
+  for (int j = std::max(0, cy - span); j <= std::min(static_cast<int>(map.info.height) - 1, cy + span); ++j) {
+    for (int i = std::max(0, cx - span); i <= std::min(static_cast<int>(map.info.width) - 1, cx + span); ++i) {
+      if (map.data[static_cast<std::size_t>(j) * map.info.width + i] < 50) {continue;}
+      const double ex = std::max({i * r - x, 0.0, x - (i + 1) * r});
+      const double ey = std::max({j * r - y, 0.0, y - (j + 1) * r});
+      best = std::min(best, std::hypot(ex, ey));
+    }
+  }
+  return best;
+}
+
+inline std::vector<Candidate> clearanceWaypoints(
+  const nav_msgs::msg::OccupancyGrid & map, double rx, double ry,
+  double radius, double margin)
+{
+  std::vector<Candidate> result;
+  int cx, cy;
+  if (!worldToCell(map, rx, ry, cx, cy) || !footprintFree(map, rx, ry, radius)) {return result;}
+  const double initial = obstacleClearance(map, rx, ry), r = map.info.resolution;
+  const double yaw = detail::originYaw(map);
+  const int span = static_cast<int>(std::ceil(0.35 / r));
+  for (int y = std::max(0, cy - span); y <= std::min(static_cast<int>(map.info.height) - 1, cy + span); ++y) {
+    for (int x = std::max(0, cx - span); x <= std::min(static_cast<int>(map.info.width) - 1, cx + span); ++x) {
+      const double lx = (x + .5) * r, ly = (y + .5) * r;
+      const double wx = map.info.origin.position.x + std::cos(yaw) * lx - std::sin(yaw) * ly;
+      const double wy = map.info.origin.position.y + std::sin(yaw) * lx + std::cos(yaw) * ly;
+      const double distance = std::hypot(wx - rx, wy - ry);
+      if (distance < .15 - 1e-9 || distance > .35 + 1e-9 ||
+        !goalFootprintFree(map, wx, wy, radius, margin) ||
+        obstacleClearance(map, wx, wy) < initial + .02 ||
+        !segmentFootprintFree(map, rx, ry, wx, wy, radius)) {continue;}
+      result.push_back({wx, wy, distance, true});
+    }
+  }
+  std::stable_sort(result.begin(), result.end(), [&](const auto & a, const auto & b) {
+      return obstacleClearance(map, a.x, a.y) > obstacleClearance(map, b.x, b.y);
+    });
+  return result;
+}
+
 inline std::size_t knownFreeCells(const nav_msgs::msg::OccupancyGrid & map)
 {
   if (!validMap(map)) {
@@ -266,6 +398,7 @@ inline SearchResult findCandidates(
 
   int sx = -1;
   int sy = -1;
+  result.unresolved_frontier_cells = result.frontier_cells;
   result.robot_in_known_free = worldToCell(map, rx, ry, sx, sy) &&
     detail::freeCell(map, sx, sy);
   if (!result.robot_in_known_free) {
@@ -273,6 +406,7 @@ inline SearchResult findCandidates(
   }
   result.robot_footprint_free = footprintFree(map, rx, ry, padded_radius);
   if (!result.robot_footprint_free) {return result;}
+  result.unresolved_frontier_cells = 0;
 
   const double yaw = detail::originYaw(map);
   const double cosine = std::cos(yaw);
@@ -362,6 +496,28 @@ inline SearchResult findCandidates(
   }
   std::vector<unsigned char> visited(cells, 0);
   std::vector<unsigned char> used_standpoints(cells, 0);
+  // A tiny opening can lead to a whole unknown room. Never classify it as a
+  // wall speck merely because its frontier itself contains fewer than 5 cells.
+  std::vector<std::size_t> unknown_sizes(cells, 0);
+  const auto unknown_size = [&](std::size_t seed) {
+      if (unknown_sizes[seed]) {return unknown_sizes[seed];}
+      std::vector<std::size_t> component{seed};
+      unknown_sizes[seed] = 1;
+      for (std::size_t head = 0; head < component.size(); ++head) {
+        const auto current = component[head];
+        const int x = current % width, y = current / width;
+        for (const auto & d : detail::kDirections4) {
+          const int nx = x + d.first, ny = y + d.second;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) {continue;}
+          const auto next = static_cast<std::size_t>(ny) * width + nx;
+          if (map.data[next] < 0 && !unknown_sizes[next]) {
+            unknown_sizes[next] = 1; component.push_back(next);
+          }
+        }
+      }
+      for (const auto c : component) {unknown_sizes[c] = component.size();}
+      return component.size();
+    };
   std::vector<Candidate> ordinary;
   std::vector<Candidate> short_candidates;
   for (std::size_t seed = 0; seed < cells; ++seed) {
@@ -391,13 +547,49 @@ inline SearchResult findCandidates(
       }
     }
     ++result.frontier_clusters;
-    if (cluster.size() < 5) {
-      ++result.small_clusters;
-      continue;
-    }
+    if (cluster.size() < 5) {++result.small_clusters;}
     for (const auto frontier_cell : cluster) {
-      const auto standpoint = owner[frontier_cell];
-      if (standpoint == no_cell) {++result.unreachable_frontiers; continue;}
+      const int fx = frontier_cell % width, fy = frontier_cell / width;
+      bool large_unknown = false;
+      std::vector<std::pair<int, int>> unknown;
+      for (const auto & d : detail::kDirections8) {
+        const int nx = fx + d.first, ny = fy + d.second;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) {continue;}
+        const auto cell = static_cast<std::size_t>(ny) * width + nx;
+        if (map.data[cell] < 0) {
+          unknown.emplace_back(nx, ny);
+          large_unknown = unknown_size(cell) >= 5 || large_unknown;
+        }
+      }
+      const auto visible = [&](std::size_t cell) {
+          if (cell == no_cell || steps[cell] == no_cell || !is_safe(cell)) {return false;}
+          for (const auto & u : unknown) {
+            if (seesUnknownLocal(map, (cell % width + .5) * resolution,
+              (cell / width + .5) * resolution, u.first, u.second)) {return true;}
+          }
+          return false;
+        };
+      auto standpoint = owner[frontier_cell];
+      if (!visible(standpoint)) {
+        standpoint = no_cell;
+        double nearest = std::numeric_limits<double>::infinity();
+        const int span = static_cast<int>(std::ceil(.60 / resolution));
+        for (int y = std::max(0, fy - span); y <= std::min(height - 1, fy + span); ++y) {
+          for (int x = std::max(0, fx - span); x <= std::min(width - 1, fx + span); ++x) {
+            const auto cell = static_cast<std::size_t>(y) * width + x;
+            const double distance = std::hypot(x - fx, y - fy) * resolution;
+            if (distance > .60 || distance >= nearest || !visible(cell)) {continue;}
+            standpoint = cell; nearest = distance;
+          }
+        }
+      }
+      if (standpoint == no_cell) {
+        ++result.unreachable_frontiers;
+        if (cluster.size() < 5 && !large_unknown) {++result.residual_frontier_cells;}
+        else {++result.unresolved_frontier_cells;}
+        continue;
+      }
+      ++result.actionable_frontier_cells;
       if (used_standpoints[standpoint]) {
         continue;
       }

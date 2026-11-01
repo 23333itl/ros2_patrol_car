@@ -47,7 +47,7 @@ if(BUILD_TESTING)
     COMMAND /usr/bin/python3 ${CMAKE_CURRENT_SOURCE_DIR}/test/test_explorer_actions.py
       --executable $<TARGET_FILE:explorer_node>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
-    TIMEOUT 180)
+    TIMEOUT 300)
   ament_add_test(test_mapping_replay
     COMMAND /usr/bin/python3 ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mapping_replay.py
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO

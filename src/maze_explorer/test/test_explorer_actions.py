@@ -64,12 +64,19 @@ class FakeNav2(Node):
         self.scan_span = 2.0 * math.pi
         self.has_frontiers = True
         self.robot_cell_free = True
+        self.robot_x = self.robot_y = 0.0
+        self.rounded_endgame = False
+        self.blocked_prefix_for_frontiers = False
+        self.residual_speck = False
+        self.scan_frame = 'base_footprint'
+        self.scan_time_offset = 0.0
+        self.move_on_success = False
         self.lifecycle_requests = 0
         self.counts = dict(plan=0, navigation=0, backup=0, spin=0)
         self.active_motion = 0
         self.max_active_motion = 0
         self.events = []
-        self.requests = dict(backup=[], spin=[])
+        self.requests = dict(backup=[], spin=[], navigation=[])
         self.clock_pub = self.create_publisher(Clock, '/clock', 10)
         self.tf = TransformBroadcaster(self)
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
@@ -143,12 +150,18 @@ class FakeNav2(Node):
             transform.header.frame_id = parent
             transform.child_frame_id = child
             transform.transform.rotation.w = 1.0
+            if child == 'base_footprint':
+                transform.transform.translation.x = self.robot_x
+                transform.transform.translation.y = self.robot_y
             transforms.append(transform)
         self.tf.sendTransform(transforms)
         if self.publish_scans:
             scan = LaserScan()
             scan.header.stamp = stamp
-            scan.header.frame_id = 'base_footprint'
+            value = stamp.sec + stamp.nanosec * 1e-9 + self.scan_time_offset
+            scan.header.stamp.sec = int(value)
+            scan.header.stamp.nanosec = int((value - int(value)) * 1e9)
+            scan.header.frame_id = self.scan_frame
             scan.angle_min = -self.scan_span / 2.0
             scan.angle_max = self.scan_span / 2.0
             scan.angle_increment = self.scan_span / 359.0
@@ -179,6 +192,8 @@ class FakeNav2(Node):
                     data[y * 20 + x] = -1
         if not self.robot_cell_free:
             data[10 * 20 + 10] = -1  # Robot at world (0, 0) is outside known free space.
+        if self.residual_speck:
+            data[14 * 20 + 14] = -1  # Diagonal-only contact through two occupied corners.
         grid.data = data
         if self.large_room:
             grid.info.resolution = 0.05
@@ -189,6 +204,19 @@ class FakeNav2(Node):
             for y in range(3, 27):
                 for x in range(3, 27):
                     data[y * 30 + x] = 0
+            grid.data = data
+        if self.rounded_endgame:
+            grid.info.resolution = 0.025
+            grid.info.width = grid.info.height = 40
+            grid.info.origin.position.x = grid.info.origin.position.y = 0.0
+            data = [100] * 1600
+            for y in range(4, 36):
+                for x in range(5, 34):
+                    data[y * 40 + x] = 0
+            if self.has_frontiers:
+                for y in range(10, 26):
+                    for x in range(34, 40):
+                        data[y * 40 + x] = -1
             grid.data = data
         self.map_pub.publish(grid)
 
@@ -219,7 +247,20 @@ class FakeNav2(Node):
             start = PoseStamped()
             start.header = handle.request.goal.header
             start.pose.orientation.w = 1.0
+            start.pose.position.x = self.robot_x
+            start.pose.position.y = self.robot_y
             result.path.poses = [start, handle.request.goal]
+            if self.rounded_endgame:
+                start.pose.position.x = .30
+                start.pose.position.y = .225
+                join = PoseStamped()
+                join.header = start.header
+                join.pose.position.x, join.pose.position.y = .325, .25
+                join.pose.orientation.w = 1.0
+                result.path.poses.insert(1, join)
+                if self.blocked_prefix_for_frontiers and goal.x > .55:
+                    # Reconnection would require skipping more than 5 cm.
+                    join.pose.position.x, join.pose.position.y = .36, .225
             if self.unsafe_plan:
                 # The goal is safe, but this route crosses the room's occupied wall.
                 detour = PoseStamped()
@@ -235,7 +276,7 @@ class FakeNav2(Node):
         return result
 
     def navigate(self, handle):
-        self.begin('navigation')
+        self.begin('navigation', handle.request)
         result = NavigateToPose.Result()
         while not self.stopping.wait(0.02):
             if handle.is_cancel_requested and self.release_navigation.is_set():
@@ -243,6 +284,10 @@ class FakeNav2(Node):
                 self.end('navigation')
                 return result
             if self.navigation_succeeds and not handle.is_cancel_requested:
+                if self.move_on_success:
+                    self.robot_x = handle.request.pose.pose.position.x
+                    self.robot_y = handle.request.pose.pose.position.y
+                    self.stopping.wait(.10)  # Allow the new pose to reach the TF listener.
                 handle.succeed()
                 self.end('navigation')
                 return result
@@ -272,7 +317,9 @@ class FakeNav2(Node):
 
 class ExplorerHarness:
     def __init__(self, case_number, plan_succeeds=True, frontiers=True, stream_maps=True,
-                 stream_scans=True, robot_cell_free=True, no_progress_timeout=2.0):
+                 stream_scans=True, robot_cell_free=True, no_progress_timeout=2.0,
+                 rounded_endgame=False, residual_speck=False, scan_frame='base_footprint',
+                 scan_time_offset=0.0, blocked_prefix=False):
         self.directory = tempfile.TemporaryDirectory(prefix='maze-explorer-actions-')
         self.root = Path(self.directory.name)
         self.output = self.root / 'map'
@@ -281,6 +328,13 @@ class ExplorerHarness:
         self.domain = (OPTIONS.domain_id + case_number) % 232
         rclpy.init(context=self.context, domain_id=self.domain)
         self.fake = FakeNav2(self.context, OPTIONS.clock_rate, plan_succeeds)
+        self.fake.rounded_endgame = rounded_endgame
+        self.fake.blocked_prefix_for_frontiers = blocked_prefix
+        if rounded_endgame:
+            self.fake.robot_x, self.fake.robot_y = .30, .245
+        self.fake.residual_speck = residual_speck
+        self.fake.scan_frame = scan_frame
+        self.fake.scan_time_offset = scan_time_offset
         self.fake.has_frontiers = frontiers
         self.fake.publish_maps = stream_maps
         self.fake.publish_scans = stream_scans
@@ -380,6 +434,7 @@ class ExplorerActionTests(unittest.TestCase):
                        'failed recovery remains resumable rather than falsely complete')
             self.assertEqual(h.fake.counts['backup'], 1)
             h.fake.unsafe_plan = False
+            h.fake.robot_x = .12  # A real pose improvement, not just cooldown expiry.
             h.wait_for(lambda: h.fake.counts['navigation'] >= 1, 8.0,
                        'safe path resumes navigation without granting more recoveries')
             self.assertEqual(h.fake.counts['backup'], 1)
@@ -470,15 +525,87 @@ class ExplorerActionTests(unittest.TestCase):
             self.assertEqual(h.fake.counts['spin'], 1)
             self.assertEqual(h.fake.max_active_motion, 1)
             self.assertIn('resumable: true', status)
-            # Unchanged map republishes/cooldown expiry may retry planning, but
-            # never earn another motion recovery without actual progress.
+            # Let any previously untried standpoints finish their finite pass.
             h.sim_wait(20.0)
+            plans = h.fake.counts['plan']
+            h.sim_wait(20.0)
+            self.assertEqual(h.fake.counts['plan'], plans,
+                             'unchanged maps/cooldown expiry restarted failed planning')
             self.assertEqual(h.fake.counts['backup'], 1)
             self.assertEqual(h.fake.counts['spin'], 1)
             h.fake.plan_succeeds = True
+            h.fake.robot_x = .12
             h.wait_for(lambda: h.fake.counts['navigation'] == 1, 12.0,
                        'automatic navigation resumption after a safe plan becomes available')
             self.assertIn('completed: false', h.status())
+            self.assertEqual(h.fake.max_active_motion, 1)
+
+    def test_rounded_start_navigates_then_finishes_endgame(self):
+        with ExplorerHarness(8, rounded_endgame=True, no_progress_timeout=100.0) as h:
+            h.wait_for(lambda: h.fake.counts['navigation'] == 1, 10.0,
+                       'full-body-safe connection from the actual pose')
+            self.assertIn('仅重接起点 0.05m', h.log_path.read_text())
+            h.fake.move_on_success = h.fake.navigation_succeeds = True
+            h.fake.has_frontiers = False
+            h.wait_for(lambda: 'completed: true' in h.status(), 12.0,
+                       'endgame navigation followed by five fresh clean maps')
+            self.assertIn('map_saved: true', h.status())
+            self.assertEqual(h.fake.counts['backup'], 0)
+            self.assertEqual(h.fake.counts['spin'], 0)
+            self.assertEqual(h.fake.max_active_motion, 1)
+
+    def test_only_invisible_wall_speck_can_complete_with_residual_report(self):
+        with ExplorerHarness(9, frontiers=False, residual_speck=True) as h:
+            h.wait_for(lambda: 'completed: true' in h.status(), 12.0,
+                       'no actionable frontier, with a separately reported wall speck')
+            self.assertIn('raw_frontier_cells: 1', h.status())
+            self.assertIn('residual_frontier_cells: 1', h.status())
+            self.assertIn('actionable_frontier_cells: 0', h.status())
+            self.assertEqual(sum(h.fake.counts.values()), 0)
+
+    def test_common_blocked_start_uses_one_waypoint_without_false_progress(self):
+        with ExplorerHarness(12, rounded_endgame=True, no_progress_timeout=100.0,
+                             blocked_prefix=True) as h:
+            h.wait_for(lambda: h.fake.counts['navigation'] == 1, 12.0,
+                       'one clearance waypoint after two common-prefix failures')
+            self.assertIn('中间站位', h.log_path.read_text())
+            goal = h.fake.requests['navigation'][0].pose.pose.position
+            self.assertGreaterEqual(math.hypot(goal.x - .30, goal.y - .245), .15 - 1e-6)
+            self.assertLessEqual(math.hypot(goal.x - .30, goal.y - .245), .35 + 1e-6)
+            # An Action success without motion or observation must not replenish
+            # the waypoint/recovery budget or count as real exploration progress.
+            h.fake.navigation_succeeds = True
+            h.wait_for(lambda: 'resumable: true' in h.status(), 24.0,
+                       'bounded recovery followed by passive waiting')
+            plans = h.fake.counts['plan']
+            h.sim_wait(20.0)
+            self.assertEqual(h.fake.counts['plan'], plans,
+                             'a blocked common start reopened untried distant targets')
+            self.assertEqual(h.fake.counts['navigation'], 1)
+            self.assertEqual(h.fake.counts['backup'], 1)
+            self.assertEqual(h.fake.counts['spin'], 1)
+            self.assertIn('completed: false', h.status())
+
+    def test_missing_scan_tf_does_not_reopen_failed_goals_on_cooldown(self):
+        with ExplorerHarness(10, plan_succeeds=False, scan_frame='missing_laser') as h:
+            h.wait_for(lambda: 'resumable: true' in h.status(), 15.0,
+                       'wait for the precise scan-time TF dependency')
+            self.assertIn('扫描时刻', h.status())
+            plans = h.fake.counts['plan']
+            h.sim_wait(24.0)
+            self.assertEqual(h.fake.counts['plan'], plans)
+            self.assertEqual(h.fake.counts['backup'], 0)
+            h.fake.scan_frame = 'base_footprint'
+            h.wait_for(lambda: h.fake.counts['spin'] == 1, 8.0,
+                       'the single deferred recovery after TF input returns')
+            self.assertEqual(h.fake.counts['backup'], 1)
+            self.assertEqual(h.fake.max_active_motion, 1)
+
+    def test_recovery_can_use_older_fresh_scan_when_latest_tf_is_pending(self):
+        with ExplorerHarness(11, plan_succeeds=False, scan_time_offset=.05) as h:
+            h.wait_for(lambda: h.fake.counts['spin'] == 1, 18.0,
+                       'a fresh complete older scan whose exact-time TF is available')
+            self.assertEqual(h.fake.counts['backup'], 1)
             self.assertEqual(h.fake.max_active_motion, 1)
 
     def test_recovery_waits_for_full_scan_and_resumes_after_global_map_overlap_clears(self):
@@ -548,8 +675,9 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--scenario', choices=['all', 'cancel', 'complete', 'stalled',
                                                'interrupted', 'recovery_scan', 'selection', 'handoff',
-                                               'fairness'],
-                        default='all', help='run one regression scenario or all eight')
+                                               'fairness', 'endgame', 'residual', 'missing_tf', 'pending_tf',
+                                               'waypoint'],
+                        default='all', help='run one regression scenario or all cases')
     parser.add_argument('--executable', '--explorer-binary', dest='explorer_binary', type=Path,
                         default=workspace / 'install/maze_explorer/lib/maze_explorer/explorer_node')
     parser.add_argument('--domain-id', type=int, default=40 + os.getpid() % 100,
@@ -575,6 +703,11 @@ def main():
         'selection': 'test_unsafe_paths_and_cooldowns_cannot_extend_selection_indefinitely',
         'handoff': 'test_lifecycle_refresh_during_navigation_avoids_goal_handoff_pause',
         'fairness': 'test_bounded_rounds_try_short_goals_and_do_not_starve_far_safe_goals',
+        'endgame': 'test_rounded_start_navigates_then_finishes_endgame',
+        'residual': 'test_only_invisible_wall_speck_can_complete_with_residual_report',
+        'missing_tf': 'test_missing_scan_tf_does_not_reopen_failed_goals_on_cooldown',
+        'pending_tf': 'test_recovery_can_use_older_fresh_scan_when_latest_tf_is_pending',
+        'waypoint': 'test_common_blocked_start_uses_one_waypoint_without_false_progress',
     }
     selected = names.values() if OPTIONS.scenario == 'all' else [names[OPTIONS.scenario]]
     suite = unittest.TestSuite(ExplorerActionTests(name) for name in selected)
