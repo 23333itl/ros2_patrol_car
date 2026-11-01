@@ -288,7 +288,7 @@ void writeWorld(const fs::path& path, const Maze& m, const Options& o,
   w << "<?xml version=\"1.0\" ?>\n<sdf version=\"1.8\">\n  <world name=\"" << o.name << "\">\n"
     << "    <gravity>0 0 -9.8</gravity>\n"
     << "    <physics name=\"default_physics\" type=\"ignored\">\n"
-    << "      <max_step_size>0.001</max_step_size>\n"
+    << "      <max_step_size>0.01</max_step_size>\n"
     << "      <real_time_factor>1.0</real_time_factor>\n"
     << "      <real_time_update_rate>1000</real_time_update_rate>\n"
     << "    </physics>\n"

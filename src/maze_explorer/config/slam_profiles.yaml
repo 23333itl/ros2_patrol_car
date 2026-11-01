@@ -49,11 +49,13 @@ heading_prior_turn:
 # 局部/全局回环候选在 1510 s 回放中均未通过几何验收，不在这里启用。
 simulation_stable:
   
-  minimum_travel_distance: 0.02
-  minimum_travel_heading: 0.02
+  minimum_travel_distance: 0.20   # 走 15 厘米才纠偏
+  minimum_travel_heading: 0.1     # 转 5 度才纠偏
   minimum_time_interval: 0.1
-  transform_publish_period: 0.05
-  transform_timeout: 0.5
+  transform_publish_period: 0.15   # 降到 10Hz 发布 TF
+  # 顺便把匹配分辨率调粗一点，别让它算那么精细
+  correlation_search_space_resolution: 0.05
+  correlation_search_space_smear_deviation: 0.2
 
   use_scan_matching: true
   do_loop_closing: false
